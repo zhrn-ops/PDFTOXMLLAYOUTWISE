@@ -1,0 +1,108 @@
+<?xml version='1.0' encoding='utf-8'?>
+<units xmlns="http://www.elsevier.com/xml/ani/ani" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:ce="http://www.elsevier.com/xml/ani/common" xsi:schemaLocation="http://www.elsevier.com/xml/ani/ani http://www.elsevier.com/xml/ani/ani515-input-CAR.xsd">
+<unit type="ARTICLE">
+<unit-info>
+<unit-id>70718567</unit-id>
+<order-id>140631028</order-id>
+<parcel-id>none</parcel-id>
+<supplier-id>4</supplier-id>
+<timestamp>2026-08-04T06:33:38.666410Z</timestamp>
+</unit-info>
+<unit-content>
+<bibrecord>
+<item-info>
+<status state="new" stage="S300"/>
+<itemidlist>
+<ce:doi>10.1055/s-0046-1820717</ce:doi>
+<itemid idtype="OSIN">76346499</itemid>
+<itemid idtype="ABSN">OP062</itemid>
+</itemidlist>
+</item-info>
+<head>
+<citation-info>
+<citation-type code="cb"/>
+<citation-language xml:lang="ENG"/>
+<abstract-language xml:lang="ENG"/>
+</citation-info>
+<citation-title>
+<titletext xml:lang="ENG" original="y">A comparison of white-box and black-box models in computer-aided diagnosis for colon polyps: a randomized controlled trial</titletext>
+</citation-title>
+<author-group seq="1">
+<author seq="1">
+<ce:initials>J.H.</ce:initials>
+<ce:surname>Bae</ce:surname>
+</author>
+<author seq="2">
+<ce:initials>J.</ce:initials>
+<ce:surname>Kim</ce:surname>
+</author>
+<affiliation>
+<organization>Seoul National University Hospital</organization>
+<city>Seoul</city>
+<country iso-code="KOR"/>
+<ce:source-text>Seoul National University Hospital, Seoul, Republic of Korea</ce:source-text>
+</affiliation>
+</author-group>
+<correspondence>
+<person>
+<ce:initials>J.H.</ce:initials>
+<ce:surname>Bae</ce:surname>
+</person>
+<affiliation>
+<organization>Seoul National University Hospital</organization>
+<city>Seoul</city>
+<country iso-code="KOR"/>
+<ce:source-text>Seoul National University Hospital, Seoul, Republic of Korea</ce:source-text>
+</affiliation>
+</correspondence>
+<abstracts>
+<abstract original="y" xml:lang="ENG">
+<ce:para>Aims Computer-aided diagnosis (CADx) for optical characterization of colorectal polyps is intruduced into colonoscopy practice, yet concerns regarding the poor collaboration and the “black-box” nature of deep learning (DL) models persist. Limited interpretability may impede clinicians’ trust, appropriate reliance, and real-world adoption. “White-box” explainable AI (XAI) systems that provide human-interpretable reasoning have been proposed as a solution, but direct empirical evidence comparing white-box and black-box CADx models in clinical decision-making remains scarce. This randomized controlled trial evaluated whether a white-box XAI model improves diagnostic performance, confidence calibration, and technology acceptance compared with a conventional black-box DL CADx model [1]. Methods We conducted a prospective, two-stage multicenter study involving 112 endoscopists. In the baseline ex vivo assessment, participants performed optical diagnosis without AI support on 200 narrow-band imaging (NBI) still images (120 adenomas, 80 hyperplastic polyps). Baseline overall accuracy (OA), high-confidence accuracy (HCA), and high-confidence rate (HCR) were calculated. After a one-month washout period to minimize recall bias, participants were stratified as high vs. low performers based on baseline HCA and HC, then randomized 1:1 to either a black-box DL CADx group or a white-box XAI CADx group. During the second stage, participants re-evaluated the identical image set using their assigned CADx system, which differed only in explainability features while maintaining comparable core classification architecture. To evaluate psychological determinants of adoption, participants completed a validated Unified Theory of Acceptance and Use of Technology (UTAUT)-based questionnaire assessing performance expectancy, effort expectancy, social influence, facilitating conditions, and resistance bias. Structural equation modeling was applied to examine differential effects on behavioral intention across the two CADx modalities. Results Baseline performance without AI showed moderate diagnostic proficiency across participants: OA 66.2 %, HCA 70.8 %, and HCR 62.0 %. When CADx support was introduced, significant differences emerged between white-box and black-box models. The XAI group achieved higher OA than the DL group (80.6 % vs. 77.2 %; p = 0.025) and a markedly superior HCA (88.8 % vs. 83.0 %; p &lt; 0.001). Conversely, the HCR was lower in the XAI group (61 % vs. 71 %; p = 0.005). Stratified analyses revealed distinct effects based on baseline expertise. Among high performers, only HCA improved significantly with white-box XAI, while OA and HCR did not differ. Among low performers, however, XAI substantially improved OA, HCA, and HCR. Technology acceptance analysis further differentiated the two systems. In the black-box DL group, resistance bias exerted a significant negative influence on behavioral intention. In contrast, in the white-box XAI group, resistance bias did not significantly predict behavioral intention. Other UTAUT constructs showed similar directional trends across groups, reinforcing explainability as the key distinction. Conclusions The white-box XAI model significantly outperformed the black-box DL model in overall accuracy and high-confidence accuracy, with particularly striking benefits among lower-performing endoscopists. Crucially, white-box explanations neutralized the detrimental effect of resistance bias on behavioral intention, suggesting that interpretability is critical for clinician trust and future adoption. These results highlight explainability as a central determinant of effective human–AI interaction and underscore the importance of transitioning from black-box to white-box CADx systems for safe, trustworthy, and widely accepted optical diagnosis in colonoscopy.</ce:para>
+</abstract>
+</abstracts>
+<source srcid="640913599" type="journal">
+<sourcetitle>Endoscopy</sourcetitle>
+<sourcetitle-abbrev>Endoscopy</sourcetitle-abbrev>
+<issn type="print">0013726X</issn>
+<volisspag>
+<volume-issue-number>
+<vol-first>58</vol-first>
+<suppl>Supplement3</suppl>
+</volume-issue-number>
+<page-information>
+<pages>
+<first-page>S49</first-page>
+<last-page>S50</last-page>
+</pages>
+</page-information>
+</volisspag>
+<publicationyear first="2026"/>
+<publicationdate>
+<year>2026</year>
+<month>06</month>
+<day>01</day>
+<date-text>June 2026</date-text>
+</publicationdate>
+<publisher>
+<publishername>Georg Thieme Verlag</publishername>
+</publisher>
+<additional-srcinfo>
+<conferenceinfo>
+<confevent>
+<confname>European Society of Gastrointestinal Endoscopy Days, ESGE 2026</confname>
+<conflocation country="ITA">
+<city>Milan</city>
+</conflocation>
+<confdate>
+<startdate>2026-05-14</startdate>
+<enddate>2026-05-16</enddate>
+</confdate>
+</confevent>
+</conferenceinfo>
+</additional-srcinfo>
+</source>
+</head>
+</bibrecord>
+</unit-content>
+</unit>
+</units>

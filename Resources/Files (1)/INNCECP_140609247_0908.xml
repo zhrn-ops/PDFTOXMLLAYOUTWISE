@@ -1,0 +1,110 @@
+<?xml version='1.0' encoding='utf-8'?>
+<units xmlns="http://www.elsevier.com/xml/ani/ani" xmlns:ce="http://www.elsevier.com/xml/ani/common">
+  <unit type="ARTICLE">
+    <unit-info>
+      <unit-id>1</unit-id>
+      <order-id>unknown</order-id>
+      <parcel-id>none</parcel-id>
+      <supplier-id>4</supplier-id>
+      <timestamp>2026-08-01T07:08:07.312560Z</timestamp>
+    </unit-info>
+    <unit-content>
+      <bibrecord>
+        <item-info>
+          <status state="new"/>
+          <itemidlist>
+            <itemid idtype="ABSN">eP328</itemid>
+          </itemidlist>
+        </item-info>
+        <head>
+          <citation-info>
+            <citation-type code="ar"/>
+            <citation-language xml:lang="ENG"/>
+            <abstract-language xml:lang="ENG"/>
+          </citation-info>
+          <citation-title>
+            <titletext xml:lang="ENG" original="y">Efficacy and Safety of Therapeutic ERCP in the Elderly: A Tunisian Single Center Experience</titletext>
+          </citation-title>
+          <author-group seq="1">
+            <author seq="1">
+              <ce:initials>R.</ce:initials>
+              <ce:surname>Limam</ce:surname>
+            </author>
+            <author seq="2">
+              <ce:initials>M.</ce:initials>
+              <ce:surname>Ben Abdelwahed</ce:surname>
+            </author>
+            <author seq="3">
+              <ce:initials>N.</ce:initials>
+              <ce:surname>Ben Chaaben</ce:surname>
+            </author>
+            <author seq="4">
+              <ce:initials>R.</ce:initials>
+              <ce:surname>Baklouti</ce:surname>
+            </author>
+            <author seq="5">
+              <ce:initials>I.</ce:initials>
+              <ce:surname>Jemni</ce:surname>
+            </author>
+            <author seq="6">
+              <ce:initials>A.</ce:initials>
+              <ce:surname>Sabbek</ce:surname>
+            </author>
+            <author seq="7">
+              <ce:initials>M.</ce:initials>
+              <ce:surname>Zakhama</ce:surname>
+            </author>
+            <author seq="8">
+              <ce:initials>A.</ce:initials>
+              <ce:surname>Guedich</ce:surname>
+            </author>
+            <author seq="9">
+              <ce:initials>M.H.</ce:initials>
+              <ce:surname>Loghmari</ce:surname>
+            </author>
+            <author seq="10">
+              <ce:initials>L.</ce:initials>
+              <ce:surname>Safer</ce:surname>
+            </author>
+            <affiliation>
+              <!--telemetry: {"confidence": 3.59}-->
+              <organization>Gastroenterology department</organization>
+              <organization>Fattouma Bourguiba Hospital</organization>
+              <city>Monastir</city>
+              <country iso-code="TUN"/>
+              <ce:source-text>Gastroenterology department, Fattouma Bourguiba Hospital, Monastir, Tunisia</ce:source-text>
+            </affiliation>
+          </author-group>
+          <correspondence>
+            <person>
+              <ce:initials>R.</ce:initials>
+              <ce:surname>Limam</ce:surname>
+            </person>
+            <affiliation>
+              <!--telemetry: {"confidence": 3.59}-->
+              <organization>Gastroenterology department</organization>
+              <organization>Fattouma Bourguiba Hospital</organization>
+              <city>Monastir</city>
+              <country iso-code="TUN"/>
+              <ce:source-text>Gastroenterology department, Fattouma Bourguiba Hospital, Monastir, Tunisia</ce:source-text>
+            </affiliation>
+          </correspondence>
+          <abstracts>
+            <abstract original="y" xml:lang="ENG">
+              <ce:para>Aims Endoscopic retrograde cholangiopancreatography (ERCP) has been an important therapeutic measure for the treatment of pancreatobiliary diseases in the elderly. This study aimed to evaluate the efficacy and safety of ERCP in patients 65 years of age or older. Methods We conducted a single-center transversal prospective study including all patients who had an ERCP procedure in a Tunisian Gastroenterology department from September 2022 to October 2023. The patients were divided into two groups: Group A: Age &lt; 65 years (N = 83) Group B: Age ≥ 65 years (N = 90) Data collection and statistical analysis were performed using SPSS 22.0. Results During the study period, a total of 173 ERCPs were enrolled. 47.7 % of the patients were 65 years of age or older. There was no significant difference between the two groups in terms of sex (p = 0.87). Common bile duct (CBD) stones were the most common indication for ERCP in both groups (p = 0.21). Acute cholangitis was present in 39 % of elderly subjects at the time of ERCP compared to only 23.3 % of younger subjects (p = 0.032). The periampullary diverticulum was observed significantly more frequently in group B than in group A (20.7 % vs 6.9 %, p = 0.019). The rate of difficult biliary cannulation was similar between the two groups (36.8 % vs 32.1 %, p &gt; 0.05). The overall success rate (92.7 % vs. 90 %, P &gt; 0.05) and the complication rate (6.59 % vs. 5.25 %, P &gt; 0.05) were not significantly different between the 2 groups. The rate of post-ERCP pancreatitis was higher in the elderly group (8.9 % vs 4.9 %), although this was not statistically significant (p &gt; 0.05). Conclusions In our study, ERCP was safe and effective in elderly patients despite a higher rate of peri-ampullary diverticula and acute cholangitis.</ce:para>
+            </abstract>
+          </abstracts>
+          <source srcid="???">
+            <volisspag>
+              <page-information>
+                <pages>
+                  <first-page>S397</first-page>
+                </pages>
+              </page-information>
+            </volisspag>
+          </source>
+        </head>
+      </bibrecord>
+    </unit-content>
+  </unit>
+</units>
