@@ -1,0 +1,279 @@
+[33mcommit 20569cb1adfb7fa865afaeb1d1ccb4f55cb606fd[m
+Author: zhrn-ops <mhmdzhrn97@gmail.com>
+Date:   Thu Sep 3 11:28:58 2026 +0530
+
+    Refactor code structure for improved readability and maintainability
+
+[1mdiff --git a/pdf_to_jats/core/__pycache__/jats_generator.cpython-311.pyc b/pdf_to_jats/core/__pycache__/jats_generator.cpython-311.pyc[m
+[1mindex 8dde109..9cf05a0 100644[m
+Binary files a/pdf_to_jats/core/__pycache__/jats_generator.cpython-311.pyc and b/pdf_to_jats/core/__pycache__/jats_generator.cpython-311.pyc differ
+[1mdiff --git a/pdf_to_jats/core/__pycache__/pdf_extractor.cpython-311.pyc b/pdf_to_jats/core/__pycache__/pdf_extractor.cpython-311.pyc[m
+[1mindex 02c8369..bff1591 100644[m
+Binary files a/pdf_to_jats/core/__pycache__/pdf_extractor.cpython-311.pyc and b/pdf_to_jats/core/__pycache__/pdf_extractor.cpython-311.pyc differ
+[1mdiff --git a/pdf_to_jats/core/jats_generator.py b/pdf_to_jats/core/jats_generator.py[m
+[1mindex b6c7d88..8061c33 100644[m
+[1m--- a/pdf_to_jats/core/jats_generator.py[m
+[1m+++ b/pdf_to_jats/core/jats_generator.py[m
+[36m@@ -82,7 +82,7 @@[m [mclass JATSGenerator:[m
+         body = etree.SubElement(parent, self._qname("body"))[m
+         for paragraph in paragraphs:[m
+             para = etree.SubElement(body, self._qname("para", self.CE_NS))[m
+[31m-            para.text = self._sanitize_xml_text(paragraph.text)[m
+[32m+[m[32m            para.text = self._sanitize_para_text(paragraph.text)[m
+ [m
+     def _append_unit_info(self, parent: Any, document: Document) -> None:[m
+         unit_info = etree.SubElement(parent, self._qname("unit-info"))[m
+[36m@@ -103,7 +103,7 @@[m [mclass JATSGenerator:[m
+         if doi:[m
+             etree.SubElement(itemidlist, self._qname("doi", self.CE_NS)).text = doi[m
+         abstract_number = self._metadata_value(document, "abstract_number", "ABSN")[m
+[31m-        default_itemids = [("OSIN", "00000000"), (abstract_number, "ABS0")][m
+[32m+[m[32m        default_itemids = [("00000000", "OSIN"), (abstract_number, "ABSN")][m
+         for item_id, idtype in self._metadata_list(document, "itemids", default_itemids):[m
+             itemid = etree.SubElement(itemidlist, self._qname("itemid"))[m
+             itemid.set("idtype", idtype)[m
+[36m@@ -122,7 +122,7 @@[m [mclass JATSGenerator:[m
+         titletext = etree.SubElement(citation_title, self._qname("titletext"))[m
+         titletext.set(self._qname_attr("lang", "http://www.w3.org/XML/1998/namespace"), self._metadata_value(document, "language", "ENG"))[m
+         titletext.set("original", "y")[m
+[31m-        titletext.text = self._sanitize_title(document.title) or "Untitled"[m
+[32m+[m[32m        titletext.text = self._sanitize_title(document.title, document.abstract_number()) or "Untitled"[m
+ [m
+         author_group = etree.SubElement(head, self._qname("author-group"))[m
+         author_group.set("seq", "1")[m
+[36m@@ -146,7 +146,7 @@[m [mclass JATSGenerator:[m
+             abstract.set("original", "y")[m
+             abstract.set(self._qname_attr("lang", "http://www.w3.org/XML/1998/namespace"), self._metadata_value(document, "language", "ENG"))[m
+             para = etree.SubElement(abstract, self._qname("para", self.CE_NS))[m
+[31m-            para.text = self._sanitize_xml_text(document.abstract)[m
+[32m+[m[32m            para.text = self._sanitize_para_text(document.abstract)[m
+ [m
+         source = etree.SubElement(head, self._qname("source"))[m
+         source.set("srcid", self._metadata_value(document, "srcid", "000000000"))[m
+[36m@@ -224,12 +224,24 @@[m [mclass JATSGenerator:[m
+             if ch in "\t\n\r" or ord(ch) >= 0x20[m
+         )[m
+ [m
+[31m-    def _sanitize_title(self, value: str | None) -> str:[m
+[32m+[m[32m    def _sanitize_para_text(self, value: str | None) -> str:[m
+[32m+[m[32m        """Normalize paragraph whitespace so serialized paragraphs have no hard enters."""[m
+[32m+[m
+[32m+[m[32m        return re.sub(r"\s+", " ", self._sanitize_xml_text(value)).strip()[m
+[32m+[m
+[32m+[m[32m    def _sanitize_title(self, value: str | None, abstract_number: str = "") -> str:[m
+         """Remove obvious DOI and section-heading noise from the title field."""[m
+ [m
+         text = self._sanitize_xml_text(value).strip()[m
+         if not text:[m
+             return ""[m
+[32m+[m[32m        if abstract_number:[m
+[32m+[m[32m            text = re.sub([m
+[32m+[m[32m                rf"^\s*{re.escape(abstract_number)}\s*(?:\||\u2502)\s*",[m
+[32m+[m[32m                "",[m
+[32m+[m[32m                text,[m
+[32m+[m[32m                count=1,[m
+[32m+[m[32m            )[m
+         text = re.sub(r"^\s*doi:\s*\S+\s*", "", text, flags=re.IGNORECASE)[m
+         text = re.sub(r"\bA\s*B\s*S\s*T\s*R\s*A\s*C\s*T\b", "", text, flags=re.IGNORECASE)[m
+         text = re.sub(r"\s{2,}", " ", text).strip(" -:;,.")[m
+[1mdiff --git a/pdf_to_jats/core/pdf_extractor.py b/pdf_to_jats/core/pdf_extractor.py[m
+[1mindex bb6a563..0bd4aaa 100644[m
+[1m--- a/pdf_to_jats/core/pdf_extractor.py[m
+[1m+++ b/pdf_to_jats/core/pdf_extractor.py[m
+[36m@@ -159,7 +159,7 @@[m [mclass PDFExtractor:[m
+             return "", [][m
+ [m
+         patterns = [[m
+[31m-            r"^\s*(\d{3,6})\s*(?:\||\u2502)\s*\d+\b",[m
+[32m+[m[32m            r"^\s*(\d{3,6})\s*(?:\||\u2502)\s*",[m
+             r"^\s*(\d{3,6})\s*$",[m
+             r"\b(?:abstract\s*(?:no\.?|number|nr\.?|id)?|absn)\s*[:#-]?\s*([A-Z0-9][A-Z0-9./-]{1,30})\b",[m
+         ][m
+[1mdiff --git a/pdf_to_jats/gui/__pycache__/main_window.cpython-311.pyc b/pdf_to_jats/gui/__pycache__/main_window.cpython-311.pyc[m
+[1mindex 28cdc67..ba3b47c 100644[m
+Binary files a/pdf_to_jats/gui/__pycache__/main_window.cpython-311.pyc and b/pdf_to_jats/gui/__pycache__/main_window.cpython-311.pyc differ
+[1mdiff --git a/pdf_to_jats/gui/__pycache__/styles.cpython-311.pyc b/pdf_to_jats/gui/__pycache__/styles.cpython-311.pyc[m
+[1mindex ce3e558..741f1d7 100644[m
+Binary files a/pdf_to_jats/gui/__pycache__/styles.cpython-311.pyc and b/pdf_to_jats/gui/__pycache__/styles.cpython-311.pyc differ
+[1mdiff --git a/pdf_to_jats/gui/main_window.py b/pdf_to_jats/gui/main_window.py[m
+[1mindex e434ea9..3b0c204 100644[m
+[1m--- a/pdf_to_jats/gui/main_window.py[m
+[1m+++ b/pdf_to_jats/gui/main_window.py[m
+[36m@@ -5,22 +5,28 @@[m [mfrom __future__ import annotations[m
+ from dataclasses import asdict, replace[m
+ import json[m
+ import re[m
+[31m-import traceback[m
+ from pathlib import Path[m
+ [m
+ from PySide6.QtCore import Qt[m
+[31m-from PySide6.QtGui import QKeySequence, QShortcut[m
+[32m+[m[32mfrom PySide6.QtGui import QColor, QKeySequence, QPalette, QShortcut[m
+ from PySide6.QtWidgets import ([m
+     QApplication,[m
+     QFileDialog,[m
+[32m+[m[32m    QFormLayout,[m
+[32m+[m[32m    QGridLayout,[m
+[32m+[m[32m    QGroupBox,[m
+     QHBoxLayout,[m
+     QLabel,[m
+[32m+[m[32m    QLineEdit,[m
+     QMainWindow,[m
+     QMessageBox,[m
+     QListWidget,[m
+     QListWidgetItem,[m
+     QPushButton,[m
+[32m+[m[32m    QSizePolicy,[m
+[32m+[m[32m    QSplitter,[m
+     QTextEdit,[m
+[32m+[m[32m    QToolButton,[m
+     QVBoxLayout,[m
+     QWidget,[m
+ )[m
+[36m@@ -31,14 +37,14 @@[m [mfrom pdf_to_jats.core.pdf_extractor import PDFExtractor[m
+ from pdf_to_jats.core.paragraph_reconstructor import ParagraphReconstructor[m
+ from pdf_to_jats.core.semantic_classifier import SemanticClassifier[m
+ from pdf_to_jats.core.validator import Validator[m
+[31m-from pdf_to_jats.llm.openrouter_client import OpenRouterClient[m
+[32m+[m[32mfrom pdf_to_jats.llm.openrouter_client import OpenRouterClient, OpenRouterRateLimitError[m
+ from pdf_to_jats.llm.prompts import QUESTION_ANSWER_PROMPT, ROLE_ASSIGNMENT_PROMPT[m
+ from pdf_to_jats.gui.pdf_viewer import PDFViewer[m
+ from pdf_to_jats.gui.properties_panel import PropertiesPanel[m
+ from pdf_to_jats.gui.structure_tree import StructureTree[m
+ from pdf_to_jats.gui.styles import APP_STYLE[m
+ from pdf_to_jats.models.document import DocumentZone[m
+[31m-from pdf_to_jats.utils.config import load_config[m
+[32m+[m[32mfrom pdf_to_jats.utils.config import load_config, save_openrouter_settings[m
+ [m
+ [m
+ class MainWindow(QMainWindow):[m
+[36m@@ -55,6 +61,7 @@[m [mclass MainWindow(QMainWindow):[m
+         self.paragraph_reconstructor = ParagraphReconstructor()[m
+         self.openrouter_client = OpenRouterClient([m
+             model=self.config.openrouter_model,[m
+[32m+[m[32m            fallback_models=self._configured_openrouter_fallback_models(),[m
+             api_key=self.config.openrouter_api_key or None,[m
+         )[m
+         self.linker = AuthorLinker()[m
+[36m@@ -70,7 +77,7 @@[m [mclass MainWindow(QMainWindow):[m
+         self._undo_stack: list[dict[str, object]] = [][m
+         self._active_zone_move_undo_id: str | None = None[m
+         self.setWindowTitle(self.config.app_name)[m
+[31m-        self.setMinimumSize(900, 700)[m
+[32m+[m[32m        self.setMinimumSize(720, 520)[m
+         self.setStyleSheet(APP_STYLE)[m
+         self._build_ui()[m
+         screen = QApplication.primaryScreen()[m
+[36m@@ -87,7 +94,7 @@[m [mclass MainWindow(QMainWindow):[m
+         self.setCentralWidget(central)[m
+         root = QVBoxLayout(central)[m
+ [m
+[31m-        actions = QHBoxLayout()[m
+[32m+[m[32m        actions = QGridLayout()[m
+         load_btn = QPushButton("Browse PDF")[m
+         load_btn.clicked.connect(self.load_pdf)[m
+         merge_btn = QPushButton("Merge Selected")[m
+[36m@@ -104,28 +111,78 @@[m [mclass MainWindow(QMainWindow):[m
+         xml_btn.clicked.connect(self.generate_xml)[m
+         json_btn = QPushButton("Export JSON")[m
+         json_btn.clicked.connect(self.export_json)[m
+[31m-        actions.addWidget(load_btn)[m
+[31m-        actions.addWidget(merge_btn)[m
+[31m-        actions.addWidget(continue_btn)[m
+[31m-        actions.addWidget(classify_btn)[m
+[31m-        actions.addWidget(unmerge_btn)[m
+[31m-        actions.addWidget(redo_btn)[m
+[31m-        actions.addWidget(xml_btn)[m
+[31m-        actions.addWidget(json_btn)[m
+[31m-        actions.addStretch(1)[m
+[32m+[m[32m        action_buttons = [load_btn, merge_btn, continue_btn, classify_btn, unmerge_btn, redo_btn, xml_btn, json_btn][m
+[32m+[m[32m        for index, button in enumerate(action_buttons):[m
+[32m+[m[32m            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)[m
+[32m+[m[32m            actions.addWidget(button, index // 4, index % 4)[m
+[32m+[m[32m        for column in range(4):[m
+[32m+[m[32m            actions.setColumnStretch(column, 1)[m
+         root.addLayout(actions)[m
+ [m
+[31m-        body = QHBoxLayout()[m
+[32m+[m[32m        self.openrouter_box = QGroupBox("OpenRouter")[m
+[32m+[m[32m        self.openrouter_box.setCheckable(True)[m
+[32m+[m[32m        self.openrouter_box.setChecked(False)[m
+[32m+[m[32m        openrouter_box_layout = QVBoxLayout(self.openrouter_box)[m
+[32m+[m[32m        self.openrouter_settings_panel = QWidget()[m
+[32m+[m[32m        openrouter_layout = QFormLayout(self.openrouter_settings_panel)[m
+[32m+[m[32m        self.openrouter_api_key_edit = QLineEdit(self.config.openrouter_api_key)[m
+[32m+[m[32m        self.openrouter_api_key_edit.setEchoMode(QLineEdit.Password)[m
+[32m+[m[32m        self.openrouter_api_key_edit.setPlaceholderText("sk-or-v1-...")[m
+[32m+[m[32m        api_key_container = QWidget()[m
+[32m+[m[32m        api_key_layout = QHBoxLayout(api_key_container)[m
+[32m+[m[32m        api_key_layout.setContentsMargins(0, 0, 0, 0)[m
+[32m+[m[32m        api_key_layout.addWidget(self.openrouter_api_key_edit, 1)[m
+[32m+[m[32m        self.show_api_key_btn = QToolButton()[m
+[32m+[m[32m        self.show_api_key_btn.setText("Show")[m
+[32m+[m[32m        self.show_api_key_btn.setCheckable(True)[m
+[32m+[m[32m        self.show_api_key_btn.setToolTip("Show or hide the API key")[m
+[32m+[m[32m        self.show_api_key_btn.toggled.connect(self._toggle_api_key_visibility)[m
+[32m+[m[32m        api_key_layout.addWidget(self.show_api_key_btn)[m
+[32m+[m[32m        self.openrouter_model_edit = QLineEdit(self.config.openrouter_model)[m
+[32m+[m[32m        self.openrouter_model_edit.setPlaceholderText("openrouter/free")[m
+[32m+[m[32m        self.openrouter_fallback_models_edit = QLineEdit(self.config.openrouter_fallback_models)[m
+[32m+[m[32m        self.openrouter_fallback_models_edit.setPlaceholderText([m
+[32m+[m[32m            "model-a:free, model-b:free"[m
+[32m+[m[32m        )[m
+[32m+[m[32m        for field in ([m
+[32m+[m[32m            self.openrouter_api_key_edit,[m
+[32m+[m[32m            self.openrouter_model_edit,[m
+[32m+[m[32m            self.openrouter_fallback_models_edit,[m
+[32m+[m[32m        ):[m
+[32m+[m[32m            palette = field.palette()[m
+[32m+[m[32m            palette.setColor(QPalette.ColorRole.Text, QColor("#e6e6e6"))[m
+[32m+[m[32m            palette.setColor(QPalette.ColorRole.Base, QColor("#303030"))[m
+[32m+[m[32m            field.setPalette(palette)[m
+[32m+[m[32m        openrouter_buttons = QHBoxLayout()[m
+[32m+[m[32m        apply_openrouter_btn = QPushButton("Apply")[m
+[32m+[m[32m        apply_openrouter_btn.clicked.connect(self.apply_openrouter_settings)[m
+[32m+[m[32m        test_openrouter_btn = QPushButton("Test")[m
+[32m+[m[32m        test_openrouter_btn.clicked.connect(self.test_openrouter_settings)[m
+[32m+[m[32m        openrouter_buttons.addWidget(apply_openrouter_btn)[m
+[32m+[m[32m        openrouter_buttons.addWidget(test_openrouter_btn)[m
+[32m+[m[32m        openrouter_buttons.addStretch(1)[m
+[32m+[m[32m        openrouter_layout.addRow("API key", api_key_container)[m
+[32m+[m[32m        openrouter_layout.addRow("Model", self.openrouter_model_edit)[m
+[32m+[m[32m        openrouter_layout.addRow("Fallbacks", self.openrouter_fallback_models_edit)[m
+[32m+[m[32m        openrouter_layout.addRow(openrouter_buttons)[m
+[32m+[m[32m        openrouter_box_layout.addWidget(self.openrouter_settings_panel)[m
+[32m+[m[32m        self.openrouter_box.toggled.connect(self._set_openrouter_settings_visible)[m
+[32m+[m[32m        self._set_openrouter_settings_visible(False)[m
+[32m+[m[32m        root.addWidget(self.openrouter_box)[m
+[32m+[m
+         self.viewer = PDFViewer()[m
+         self.tree = StructureTree()[m
+         self.props = PropertiesPanel()[m
+[32m+[m[32m        self.viewer.setMinimumSize(0, 0)[m
+[32m+[m[32m        self.tree.setMinimumSize(0, 0)[m
+[32m+[m[32m        self.props.setMinimumSize(0, 0)[m
+         self.tree_hint = QLabel("Selected blocks: 0")[m
+         self.tree_hint.setWordWrap(True)[m
+         self.selection_hint = QLabel("Merge selection is empty.")[m
+         self.selection_hint.setWordWrap(True)[m
+         self.selection_list = QListWidget()[m
+         self.selection_list.setSelectionMode(QListWidget.NoSelection)[m
+[31m-        self.selection_list.setMinimumHeight(120)[m
+[32m+[m[32m        self.selection_list.setMinimumHeight(80)[m
+         self.clear_selection_btn = QPushButton("Clear Selection")[m
+         self.clear_selection_btn.clicked.connect(self.clear_selection)[m
+         self.props.apply_role_btn.clicked.connect(self.apply_selected_block_role)[m
+[36m@@ -140,26 +197,107 @@[m [mclass MainWindow(QMainWindow):[m
+         self.undo_shortcut.activated.connect(self.undo_last_action)[m
+         self.continuation_preview_shortcut = QShortcut(QKeySequence(Qt.Key_Space), self)[m
+         self.continuation_preview_shortcut.activated.connect(self.show_selected_continuation_arrow)[m
+[31m-        viewer_column = QVBoxLayout()[m
+[31m-        viewer_column.addWidget(self.viewer)[m
+[31m-        tree_column = QVBoxLayout()[m
+[31m-        tree_column.addWidget(self.tree_hint)[m
+[31m-        tree_column.addWidget(self.tree)[m
+[31m-        tree_column.addWidget(self.selection_hint)[m
+[31m-        tree_column.addWidget(self.selection_list)[m
+[31m-        tree_column.addWidget(self.clear_selection_btn)[m
+[31m-        body.addLayout(viewer_column, 3)[m
+[31m-        body.addLayout

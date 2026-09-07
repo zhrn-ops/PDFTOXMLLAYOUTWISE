@@ -1,0 +1,154 @@
+<?xml version='1.0' encoding='utf-8'?>
+<units xmlns="http://www.elsevier.com/xml/ani/ani" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:ce="http://www.elsevier.com/xml/ani/common" xsi:schemaLocation="http://www.elsevier.com/xml/ani/ani http://www.elsevier.com/xml/ani/ani515-input-CAR.xsd">
+<unit type="ARTICLE">
+<unit-info>
+<unit-id>70718567</unit-id>
+<order-id>140631028</order-id>
+<parcel-id>none</parcel-id>
+<supplier-id>4</supplier-id>
+<timestamp>2026-08-04T06:13:01.242651Z</timestamp>
+</unit-info>
+<unit-content>
+<bibrecord>
+<item-info>
+<status state="new" stage="S300"/>
+<itemidlist>
+<ce:doi>10.1055/s-0046-1820702</ce:doi>
+<itemid idtype="OSIN">76346499</itemid>
+<itemid idtype="ABSN">OP047</itemid>
+</itemidlist>
+</item-info>
+<head>
+<citation-info>
+<citation-type code="cb"/>
+<citation-language xml:lang="ENG"/>
+<abstract-language xml:lang="ENG"/>
+</citation-info>
+<citation-title>
+<titletext xml:lang="ENG" original="y">Performance measures of double-balloon enteroscopy from the largest tertiary centre in the UK: A two-year quality assessment</titletext>
+</citation-title>
+<author-group seq="1">
+<author seq="1">
+<ce:initials>G.</ce:initials>
+<ce:surname>Kalopitas</ce:surname>
+</author>
+<author seq="2">
+<ce:initials>E.</ce:initials>
+<ce:surname>Athanasiadou</ce:surname>
+</author>
+<author seq="3">
+<ce:initials>E.</ce:initials>
+<ce:surname>Maristany Bosch</ce:surname>
+</author>
+<author seq="4">
+<ce:initials>E.</ce:initials>
+<ce:surname>Dell'Unto</ce:surname>
+</author>
+<author seq="5">
+<ce:initials>L.</ce:initials>
+<ce:surname>Cossa</ce:surname>
+</author>
+<author seq="7">
+<ce:initials>A.</ce:initials>
+<ce:surname>Murino</ce:surname>
+</author>
+<affiliation>
+<organization>The Royal Free Hospital</organization>
+<organization>University College London Institute for Liver and Digestive Health</organization>
+<city>London</city>
+<country iso-code="GBR"/>
+<ce:source-text>The Royal Free Hospital and University College London Institute for Liver and Digestive Health, London, United Kingdom</ce:source-text>
+</affiliation>
+</author-group>
+<author-group seq="2">
+<author seq="6">
+<ce:initials>A.</ce:initials>
+<ce:surname>Rimondi</ce:surname>
+</author>
+<author seq="8">
+<ce:initials>E.</ce:initials>
+<ce:surname>Despott</ce:surname>
+</author>
+<affiliation>
+<organization>Royal Free Hospital</organization>
+<city>London</city>
+<country iso-code="GBR"/>
+<ce:source-text>Royal Free Hospital, London, United Kingdom</ce:source-text>
+</affiliation>
+</author-group>
+<author-group seq="3">
+<author seq="7">
+<ce:initials>A.</ce:initials>
+<ce:surname>Murino</ce:surname>
+</author>
+<affiliation>
+<organization>Cleveland Clinic London Hospital</organization>
+<city>London</city>
+<country iso-code="GBR"/>
+<ce:source-text>Cleveland Clinic London Hospital, London, United Kingdom</ce:source-text>
+</affiliation>
+</author-group>
+<correspondence>
+<person>
+<ce:initials>G.</ce:initials>
+<ce:surname>Kalopitas</ce:surname>
+</person>
+<affiliation>
+<organization>The Royal Free Hospital</organization>
+<organization>University College London Institute for Liver and Digestive Health</organization>
+<city>London</city>
+<country iso-code="GBR"/>
+<ce:source-text>The Royal Free Hospital and University College London Institute for Liver and Digestive Health, London, United Kingdom</ce:source-text>
+</affiliation>
+</correspondence>
+<abstracts>
+<abstract original="y" xml:lang="ENG">
+<ce:para>Aims Double-balloon enteroscopy (DBE) plays a central role in the diagnosis and management of small-bowel disease, allowing direct visualisation of mucosal abnormalities, targeted tissue sampling, and the delivery of precise endotherapy within the same procedure [1]. As DBE is technically demanding and performance can vary across centres, the ESGE has introduced specific quality indicators to standardise practice and optimise clinical outcomes [2]. This study aimed to evaluate how DBE practice in our centre aligns with these established quality benchmarks over a two-year period. Methods All DBE procedures performed at the Royal Free Unit for Endoscopy between July 2023, and October 2025 were retrospectively reviewed from our prospectively-maintained institutional database. Baseline characteristics, performance outcomes, major and minor performance indicators were analysed. ESGE performance indicators and their thresholds were used as reference standards. Results A total of 359 DBE procedures were included in our study. DBE was performed for an appropriate indication in 98.3 % of cases. Adequate pre-procedure preparation occurred in 345 patients (96.1 %). Multidisciplinary team (MDT) discussion took place pre-procedurally in 200 cases (55.7 %). Maximum insertion depth was documented in 99.7 % of cases (n = 358) and marking with a submucosal tattoo of sterile carbon particles was performed in 72.7 % of clinically indicated cases. The overall diagnostic yield was 79.4 % and accurate photo-documentation was obtained in 70.8 %. Among lesions requiring further therapeutic intervention, 95.1 % were marked appropriately. Therapeutic intervention was performed in 60.2 % of procedures, with therapeutic success achieved in 98.6 %. Patient comfort was adequate in 96.9 % of procedures, and adverse events occurred in 0.8 % (3/359). Conclusions Our 2-year quality asessment showed that achieving established ESGE quality thresholds for DBE is feasible in routine clinical practice. In our high-volume centre, both diagnostic yield and safety outcomes exceeded current ESGE targets, while the remaining indicators were consistently within expected benchmark ranges. These findings provide real-world support for the application of ESGE quality measures in DBE services and may help inform future updates as more data become available.</ce:para>
+</abstract>
+</abstracts>
+<source srcid="640913599" type="journal">
+<sourcetitle>Endoscopy</sourcetitle>
+<sourcetitle-abbrev>Endoscopy</sourcetitle-abbrev>
+<issn type="print">0013726X</issn>
+<volisspag>
+<volume-issue-number>
+<vol-first>58</vol-first>
+<suppl>Supplement3</suppl>
+</volume-issue-number>
+<page-information>
+<pages>
+<first-page>S40</first-page>
+<last-page>S41</last-page>
+</pages>
+</page-information>
+</volisspag>
+<publicationyear first="2026"/>
+<publicationdate>
+<year>2026</year>
+<month>06</month>
+<day>01</day>
+<date-text>June 2026</date-text>
+</publicationdate>
+<publisher>
+<publishername>Georg Thieme Verlag</publishername>
+</publisher>
+<additional-srcinfo>
+<conferenceinfo>
+<confevent>
+<confname>European Society of Gastrointestinal Endoscopy Days, ESGE 2026</confname>
+<conflocation country="ITA">
+<city>Milan</city>
+</conflocation>
+<confdate>
+<startdate>2026-05-14</startdate>
+<enddate>2026-05-16</enddate>
+</confdate>
+</confevent>
+</conferenceinfo>
+</additional-srcinfo>
+</source>
+</head>
+</bibrecord>
+</unit-content>
+</unit>
+</units>

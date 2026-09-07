@@ -1,0 +1,143 @@
+<?xml version='1.0' encoding='utf-8'?>
+<units xmlns="http://www.elsevier.com/xml/ani/ani" xmlns:ce="http://www.elsevier.com/xml/ani/common">
+  <unit type="ARTICLE">
+    <unit-info>
+      <unit-id>1</unit-id>
+      <order-id>unknown</order-id>
+      <parcel-id>none</parcel-id>
+      <supplier-id>4</supplier-id>
+      <timestamp>2026-07-28T10:56:04.351507Z</timestamp>
+    </unit-info>
+    <unit-content>
+      <bibrecord>
+        <item-info>
+          <status state="new"/>
+          <itemidlist>
+            <itemid idtype="ABSN">eP188</itemid>
+          </itemidlist>
+        </item-info>
+        <head>
+          <citation-info>
+            <citation-type code="ar"/>
+            <citation-language xml:lang="ENG"/>
+            <abstract-language xml:lang="ENG"/>
+          </citation-info>
+          <citation-title>
+            <titletext xml:lang="ENG" original="y">Examinin Demo ra hic Variations in Eosinophilic Esophagitis: A Nationwide Study of Hospital Admissions (2019-2023)</titletext>
+          </citation-title>
+          <author-group seq="1">
+            <author seq="1">
+              <ce:initials>R.M.</ce:initials>
+              <ce:surname>Ram mohan</ce:surname>
+            </author>
+            <author seq="3">
+              <ce:initials>L.</ce:initials>
+              <ce:surname>Pannikodu</ce:surname>
+            </author>
+            <author seq="4">
+              <ce:initials>D.</ce:initials>
+              <ce:surname>Natt</ce:surname>
+            </author>
+            <author seq="6">
+              <ce:initials>P.</ce:initials>
+              <ce:surname>Achal</ce:surname>
+            </author>
+            <author seq="8">
+              <ce:initials>W.</ce:initials>
+              <ce:surname>Lau</ce:surname>
+            </author>
+            <author seq="9">
+              <ce:initials>P.</ce:initials>
+              <ce:surname>Venkata</ce:surname>
+            </author>
+            <author seq="10">
+              <ce:initials>Z.</ce:initials>
+              <ce:surname>Amina</ce:surname>
+            </author>
+            <author seq="11">
+              <ce:initials>S.</ce:initials>
+              <ce:surname>Giridharan</ce:surname>
+            </author>
+            <author seq="12">
+              <ce:initials>B.</ce:initials>
+              <ce:surname>Sri Harsha</ce:surname>
+            </author>
+            <author seq="13">
+              <ce:initials>P.</ce:initials>
+              <ce:surname>Mustacchia</ce:surname>
+            </author>
+            <affiliation>
+              <organization>Nassau University Medical Center</organization>
+              <city>East Meadow</city>
+              <country iso-code="USA"/>
+              <ce:source-text>Nassau University Medical Center, East Meadow, United States of America</ce:source-text>
+            </affiliation>
+          </author-group>
+          <author-group seq="2">
+            <author seq="2">
+              <ce:initials>S.R.</ce:initials>
+              <ce:surname>Magam</ce:surname>
+            </author>
+            <affiliation>
+              <organization>Nassau univerity medical center</organization>
+              <city>east</city>
+              <country iso-code="USA"/>
+              <ce:source-text>Nassau univerity medical center, east, United States of America</ce:source-text>
+            </affiliation>
+          </author-group>
+          <author-group seq="3">
+            <author seq="5">
+              <ce:initials>M.</ce:initials>
+              <ce:surname>Joy</ce:surname>
+            </author>
+            <affiliation>
+              <!--telemetry: {"edited": true}-->
+              <organization>HCA Florida Citrus Hospital</organization>
+              <city>Inverness</city>
+              <country iso-code="USA"/>
+              <ce:source-text>HCA Florida Citrus Hospital, Inverness, United States of America</ce:source-text>
+            </affiliation>
+          </author-group>
+          <author-group seq="4">
+            <author seq="7">
+              <ce:initials>A.</ce:initials>
+              <ce:surname>Tadikonda</ce:surname>
+            </author>
+            <affiliation>
+              <organization>Nassau Univeristy medical center</organization>
+              <city>east meadow</city>
+              <country iso-code="USA"/>
+              <ce:source-text>Nassau Univeristy medical center, east meadow, United States of America</ce:source-text>
+            </affiliation>
+          </author-group>
+          <correspondence>
+            <person>
+              <ce:initials>R.M.</ce:initials>
+              <ce:surname>Ram mohan</ce:surname>
+            </person>
+            <affiliation>
+              <organization>Nassau University Medical Center</organization>
+              <city>East Meadow</city>
+              <country iso-code="USA"/>
+              <ce:source-text>Nassau University Medical Center, East Meadow, United States of America</ce:source-text>
+            </affiliation>
+          </correspondence>
+          <abstracts>
+            <abstract original="y" xml:lang="ENG">
+              <ce:para>Aims Eosinophilic esophagitis (EoE) is an inflammatory condition that varies widely in incidence across different racial and gender groups. This study examines how race and gender influence the prevalence of EoE, exploring patterns and disparities. The research aims to identify which groups are most at risk through detailed statistical analysis, thereby informing targeted medical interventions and increasing awareness of the demographic variations in this chronic disease. Methods Data from the Nationwide Admission Database (HCUP) for 2019-2023 on 1,748,576 adult hospital admissions with a primary diagnosis of Eosinophilic esophagitis was analyzed. The study began with an inspection of the dataset's structure, emphasizing race, gender, and eosinophilic esophagitis indicators. Incidence rates were summarized by demographics, followed by chi-square tests to identify significant incidence variations among different racial and gender groups, using contingency tables for statistics and p-values. Logistic regression was then applied to further explore these associations, with race and gender as predictors, and eosinophilic esophagitis as the dependent outcome Results Between 2019 and 2023, 1,748,576 patients were admitted; 11051 Eosinophilic esophagitis patients were studied after propensity score matching. Logistic regression analysis highlights significant racial and gender disparities in eosinophilic esophagitis incidence. White individuals have the highest likelihood (coefficient: 2.2411, p &lt; 0.0001), with Blacks also at increased risk (coefficient: 1.0911, p &lt; 0.0001). Conversely, Other Races have a reduced likelihood (coefficient: –1.0702, p &lt; 0.0001). No significant odds difference is seen in Hispanics (coefficient: –0.0102, p = 0.9742). Males are less likely to develop the condition than females (coefficient: –0.1760, p &lt; 0.0001), emphasizing race and gender's role in the disease's prevalence Conclusions The study highlights significant racial and gender disparities in eosinophilic esophagitis (EoE) incidence, emphasizing the need for tailored healthcare strategies. Increased prevalence among White and Black populations suggests potential genetic or environmental influences, while the higher incidence in females may indicate hormonal or immune variations. These findings support the development of customized medical approaches that consider these demographic factors to improve treatment outcomes and efficacy in EoE management</ce:para>
+            </abstract>
+          </abstracts>
+          <source srcid="???">
+            <volisspag>
+              <page-information>
+                <pages>
+                  <first-page>S349</first-page>
+                </pages>
+              </page-information>
+            </volisspag>
+          </source>
+        </head>
+      </bibrecord>
+    </unit-content>
+  </unit>
+</units>

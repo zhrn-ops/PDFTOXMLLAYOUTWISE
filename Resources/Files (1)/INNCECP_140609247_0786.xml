@@ -1,0 +1,88 @@
+<?xml version='1.0' encoding='utf-8'?>
+<units xmlns="http://www.elsevier.com/xml/ani/ani" xmlns:ce="http://www.elsevier.com/xml/ani/common">
+  <unit type="ARTICLE">
+    <unit-info>
+      <unit-id>1</unit-id>
+      <order-id>unknown</order-id>
+      <parcel-id>none</parcel-id>
+      <supplier-id>4</supplier-id>
+      <timestamp>2026-08-01T05:40:20.373822Z</timestamp>
+    </unit-info>
+    <unit-content>
+      <bibrecord>
+        <item-info>
+          <status state="new"/>
+          <itemidlist>
+            <itemid idtype="ABSN">eP206</itemid>
+          </itemidlist>
+        </item-info>
+        <head>
+          <citation-info>
+            <citation-type code="ar"/>
+            <citation-language xml:lang="ENG"/>
+            <abstract-language xml:lang="ENG"/>
+          </citation-info>
+          <citation-title>
+            <titletext xml:lang="ENG" original="y">Artificial intelligence applied to small bowel capsule endoscopy reading: Analysis of diagnostic efficiency</titletext>
+          </citation-title>
+          <author-group seq="1">
+            <author seq="1">
+              <ce:initials>T.</ce:initials>
+              <ce:surname>Alía</ce:surname>
+            </author>
+            <author seq="2">
+              <ce:initials>I.</ce:initials>
+              <ce:surname>Sanabria</ce:surname>
+            </author>
+            <author seq="3">
+              <ce:initials>Á.</ce:initials>
+              <ce:surname>Bernal</ce:surname>
+            </author>
+            <author seq="4">
+              <ce:initials>C.</ce:initials>
+              <ce:surname>Rodriguez</ce:surname>
+            </author>
+            <author seq="5">
+              <ce:initials>M.A.</ce:initials>
+              <ce:surname>Macías</ce:surname>
+            </author>
+            <affiliation>
+              <!--telemetry: {"confidence": 7.69, "edited": true}-->
+              <organization>Hospital Universitario Puerta del Mar</organization>
+              <city>Cádiz</city>
+              <country iso-code="ESP"/>
+              <ce:source-text>Hospital Universitario Puerta del Mar, Cádiz, Spain</ce:source-text>
+            </affiliation>
+          </author-group>
+          <correspondence>
+            <person>
+              <ce:initials>T.</ce:initials>
+              <ce:surname>Alía</ce:surname>
+            </person>
+            <affiliation>
+              <!--telemetry: {"confidence": 7.69, "edited": true}-->
+              <organization>Hospital Universitario Puerta del Mar</organization>
+              <city>Cádiz</city>
+              <country iso-code="ESP"/>
+              <ce:source-text>Hospital Universitario Puerta del Mar, Cádiz, Spain</ce:source-text>
+            </affiliation>
+          </correspondence>
+          <abstracts>
+            <abstract original="y" xml:lang="ENG">
+              <ce:para>Aims In this study, we analyze the diagnostic profitability of artificial intelligence (AI) applied to the NeviCam small bowel capsule endoscopy (SB-CE) lecture in terms of sensitivity, specificity, positive predictive value and negative predictive value. Methods Data for 122 patients having small bowel examination with SB-CE in our center (Hospital Puerta del Mar, Cádiz) were collected between May 2023 and April 2024. Patient data were anonymized, and any personally identifying information was omitted. Every examination was reviewed by the same gastroenterologist and subsequently analyzed by the artificial intelligence model. We designed a database in which we collected patients' demographic data and number of lesions (angiectasia, erosion, ulcer, erythema, polyp, double intestinal lumen and stenosis) detected by the gastroenterologist and the artificial intelligence model. Based on these findings, we analyzed the lesion detection rate of the artificial intelligence system, as well as its effect on patients’ diagnosis and treatment changes. Results A total of 122 patients having SB-CE examination were enrolled in this study (54.9 % women and 45.1 % men) with a mean age of 56.05 ± 1.65 years (53.9 ± 2.08 women and 58.67 ± 2.6 men). The most common reason for requesting the examination was iron-deficiency anemia (43.4 %), followed by suspected inflammatory bowel disease (IBD) (27.9 %) and obscure gastrointestinal bleeding (11.5 %). Less frequent reasons included evaluation of known IBD (9 %), suspected celiac disease (3.3 %), and suspected neoplastic disease (0.8 %). After reading the SB-CE, 496 lesions were detected by the gastroenterologist (337 angiodysplasias, 93 erosions, 49 ulcers, 4 active bleedings, 2 double-lumen intestine, 9 erythema,1 polyp and 3 stenosis) while the artificial intelligence model identified 3030 presumed lesions, of which 380 were real lesions and 2680 weren´t real lesions. The artificial intelligence model didn´t notice 119 lesions. The detection rate by lesion type was 50 % for double-lumen intestine, 68.25 % for angiodysplasias, 82.79 % for erosions, 83.67 % for ulcers, 100 % for active bleeding, 100 % for erythema, 100 % for polyps, and 100 % for stenosis.These findings translate to an overall lesion detection rate of 76.61 %, with a true positive rate of 12.42 %, a false positive rate of 87.58 % and a false negative rate of 23,99 %. Analyzing the effect of AI model on changes in patients’ diagnosis and treatment, 13 cases of discordant diagnoses (Sensitivity 87 %; Specificity 100 %), implying a treatment change only in 2 of those cases. Conclusions The AI model applied to the reading of SB-CE offers immediate results, reducing significantly the reading time of the exam. Our study suggests that this model offers good accuracy with a low false negative rate. Furthermore, undetected lesions were mostly punctate angiodysplasias (Saurin P1) having a low impact on diagnosis and treatment changes, which makes the IA model a rentable option, providing a rapid reading time and efficient detection rate.</ce:para>
+            </abstract>
+          </abstracts>
+          <source srcid="???">
+            <volisspag>
+              <page-information>
+                <pages>
+                  <first-page>S356</first-page>
+                </pages>
+              </page-information>
+            </volisspag>
+          </source>
+        </head>
+      </bibrecord>
+    </unit-content>
+  </unit>
+</units>
