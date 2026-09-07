@@ -6,6 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 import logging
 import re
+from difflib import SequenceMatcher
 from typing import Any
 
 import fitz
@@ -19,9 +20,15 @@ LOGGER = logging.getLogger(__name__)
 class PDFExtractor:
     """Extract text, images, and layout information from a PDF."""
 
-    def __init__(self, visible_text_only: bool = True, dark_threshold: int = 240) -> None:
+    def __init__(
+        self,
+        visible_text_only: bool = True,
+        dark_threshold: int = 240,
+        use_docling: bool = True,
+    ) -> None:
         self.visible_text_only = visible_text_only
         self.dark_threshold = dark_threshold
+        self.use_docling = use_docling
 
     def extract(self, pdf_path: str | Path) -> Document:
         path = Path(pdf_path)
@@ -30,6 +37,8 @@ class PDFExtractor:
 
         document = Document(metadata={"source_pdf": str(path)})
         hidden_text_line_count = 0
+        docling_items, docling_status = self._extract_docling_structure(path)
+        document.metadata.update(docling_status)
         with fitz.open(path) as pdf:
             for page_index, page in enumerate(pdf, start=1):
                 visible_area = self._visible_page_rect(page)
@@ -87,6 +96,7 @@ class PDFExtractor:
                                 "noise_candidate": self._is_noise_candidate(text),
                             },
                         )
+                        self._attach_docling_evidence(extracted, docling_items)
                         document.blocks.append(extracted)
 
                 for image_index, image in enumerate(page.get_images(full=True), start=1):
@@ -116,6 +126,77 @@ class PDFExtractor:
             document.metadata["abstract_number"] = "ABSN"
         LOGGER.info("Extracted %d blocks from %s", len(document.blocks), path.name)
         return document
+
+    def _extract_docling_structure(self, path: Path) -> tuple[dict[int, list[dict[str, Any]]], dict[str, Any]]:
+        """Extract semantic structure without making it the spatial source of truth."""
+
+        if not self.use_docling:
+            return {}, {"docling_enabled": False, "docling_status": "disabled"}
+
+        try:
+            from docling.document_converter import DocumentConverter
+        except ImportError:
+            LOGGER.info("Docling is not installed; continuing with PyMuPDF only")
+            return {}, {"docling_enabled": True, "docling_status": "unavailable"}
+
+        try:
+            result = DocumentConverter().convert(str(path))
+            items_by_page: dict[int, list[dict[str, Any]]] = {}
+            for item, _level in result.document.iterate_items():
+                text = str(getattr(item, "text", "") or "").strip()
+                label = getattr(getattr(item, "label", None), "value", None) or str(getattr(item, "label", ""))
+                if not text or not label:
+                    continue
+                for provenance in getattr(item, "prov", []) or []:
+                    page = int(getattr(provenance, "page_no", 0) or 0)
+                    if page < 1:
+                        continue
+                    items_by_page.setdefault(page, []).append(
+                        {
+                            "label": label,
+                            "text": text,
+                            "item_type": type(item).__name__,
+                        }
+                    )
+            return items_by_page, {
+                "docling_enabled": True,
+                "docling_status": "ok",
+                "docling_item_count": sum(len(items) for items in items_by_page.values()),
+            }
+        except Exception as error:  # Docling is advisory; PyMuPDF must remain available.
+            LOGGER.warning("Docling structure extraction failed: %s", error)
+            return {}, {"docling_enabled": True, "docling_status": "error", "docling_error": str(error)}
+
+    def _attach_docling_evidence(
+        self, block: TextBlock, items_by_page: dict[int, list[dict[str, Any]]]
+    ) -> None:
+        """Attach the best structural match to a PyMuPDF line."""
+
+        candidates = items_by_page.get(block.page, [])
+        if not candidates:
+            return
+        normalized_block = self._normalize_text(block.text)
+        best_match: dict[str, Any] | None = None
+        best_score = 0.0
+        for candidate in candidates:
+            normalized_item = self._normalize_text(str(candidate["text"]))
+            if normalized_block in normalized_item or normalized_item in normalized_block:
+                score = 1.0
+            else:
+                score = SequenceMatcher(None, normalized_block, normalized_item).ratio()
+            if score > best_score:
+                best_score = score
+                best_match = candidate
+        if best_match is not None and best_score >= 0.45:
+            block.metadata["docling"] = {
+                "label": best_match["label"],
+                "item_type": best_match["item_type"],
+                "match_score": round(best_score, 3),
+                "text": best_match["text"],
+            }
+
+    def _normalize_text(self, text: str) -> str:
+        return " ".join(text.casefold().split())
 
     def _visible_page_rect(self, page: fitz.Page) -> fitz.Rect:
         """Return the region that should be treated as visible content."""

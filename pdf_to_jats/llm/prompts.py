@@ -20,6 +20,7 @@ QUESTION_ANSWER_PROMPT = (
     '  "unclassified": {"block_ids": ["block_005"], "text": "..."}\n'
     "}\n"
     "Use only block_ids that appear in the payload.\n"
+    "structural_evidence is an advisory Docling interpretation; treat the block text and PyMuPDF layout fields as the source evidence.\n"
     "If you can separate individual authors or affiliations, put them in items in reading order.\n"
     "Do not include explanations."
 )
@@ -61,6 +62,7 @@ ROLE_ASSIGNMENT_PROMPT = (
     "\n"
     "Rules:\n"
     "- Use only the provided block text, layout context, and answer summary.\n"
+    "- structural_evidence is advisory Docling structure, not a replacement for block text or precise layout fields.\n"
     "- Prefer title for the single best title block, not subtitles or section headers.\n"
     "- Prefer author for person names or author lists. There may be multiple author blocks, and author order matters.\n"
     "- Prefer affiliation for institutional text or affiliation lists. There may be multiple affiliation blocks, and affiliation order matters.\n"

@@ -766,6 +766,7 @@ class MainWindow(QMainWindow):
                     "bold": block.bold,
                     "italic": block.italic,
                     "alignment": block.alignment,
+                    "structural_evidence": block.metadata.get("docling", {}),
                 }
                 for block in selected_blocks
             ]
