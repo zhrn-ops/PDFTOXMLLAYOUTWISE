@@ -211,5 +211,6 @@ class AuthorLinker:
             return False
         if len(cleaned) > 8 and sum(1 for ch in cleaned if ch.isupper()) == len([ch for ch in cleaned if ch.isalpha()]):
             # Very short all-caps shards are usually OCR noise.
+            # spatial author and affiliations algorithm i have to build a better one
             return False
         return bool(re.search(r"[A-Za-z]", cleaned))
