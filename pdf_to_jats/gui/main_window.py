@@ -60,11 +60,7 @@ class MainWindow(QMainWindow):
         )
         self.classifier = SemanticClassifier()
         self.paragraph_reconstructor = ParagraphReconstructor()
-        self.openrouter_client = OpenRouterClient(
-            model=self.config.openrouter_model,
-            fallback_models=self._configured_openrouter_fallback_models(),
-            api_key=self.config.openrouter_api_key or None,
-        )
+        self.openrouter_client = self._create_llm_client()
         self.linker = AuthorLinker()
         self.generator = JATSGenerator()
         self.validator = Validator()
@@ -236,6 +232,13 @@ class MainWindow(QMainWindow):
             if model.strip()
         )
 
+    def _create_llm_client(self) -> OpenRouterClient:
+        return OpenRouterClient(
+            model=self.config.openrouter_model,
+            fallback_models=self._configured_openrouter_fallback_models(),
+            api_key=self.config.openrouter_api_key or None,
+        )
+
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         """Stack the work areas when the window is too narrow for three panes."""
 
@@ -262,11 +265,7 @@ class MainWindow(QMainWindow):
         self.config.openrouter_model = self.openrouter_model_edit.text().strip() or "openrouter/free"
         self.config.openrouter_fallback_models = self.openrouter_fallback_models_edit.text().strip()
         save_openrouter_settings(self.config)
-        self.openrouter_client = OpenRouterClient(
-            model=self.config.openrouter_model,
-            fallback_models=self._configured_openrouter_fallback_models(),
-            api_key=self.config.openrouter_api_key or None,
-        )
+        self.openrouter_client = self._create_llm_client()
         key_label = self._masked_openrouter_key(self.config.openrouter_api_key)
         self._log(
             f"OpenRouter settings applied: model={self.config.openrouter_model}, key={key_label}"
