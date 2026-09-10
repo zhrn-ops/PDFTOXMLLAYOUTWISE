@@ -5,9 +5,10 @@ from __future__ import annotations
 from dataclasses import asdict, replace
 import json
 import re
+from html import escape
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QUrl, Qt
 from PySide6.QtGui import QColor, QKeySequence, QPalette, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSplitter,
     QTextEdit,
+    QTextBrowser,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -57,6 +59,9 @@ class MainWindow(QMainWindow):
         self.extractor = PDFExtractor(
             visible_text_only=self.config.visible_text_only,
             dark_threshold=self.config.visible_text_dark_threshold,
+            # Docling is optional enrichment and can load heavyweight OCR
+            # models during PDF open. PyMuPDF remains the layout source.
+            use_docling=False,
         )
         self.classifier = SemanticClassifier()
         self.paragraph_reconstructor = ParagraphReconstructor()
@@ -68,6 +73,7 @@ class MainWindow(QMainWindow):
         self.current_xml_path: Path | None = None
         self._last_manual_merge: dict[str, object] | None = None
         self._redo_manual_merge: dict[str, object] | None = None
+        self._html_preview_merges: list[tuple[str, ...]] = []
         self._selected_block_ids: set[str] = set()
         self._selected_zone_id: str | None = None
         self._selected_zone_ids: set[str] = set()
@@ -104,9 +110,9 @@ class MainWindow(QMainWindow):
         unmerge_btn.clicked.connect(self.undo_last_merge)
         redo_btn = QPushButton("Redo Merge")
         redo_btn.clicked.connect(self.redo_last_merge)
-        xml_btn = QPushButton("Generate XML")
+        xml_btn = QPushButton("Generate XML...")
         xml_btn.clicked.connect(self.generate_xml)
-        json_btn = QPushButton("Export JSON")
+        json_btn = QPushButton("Export JSON...")
         json_btn.clicked.connect(self.export_json)
         action_buttons = [load_btn, merge_btn, continue_btn, classify_btn, unmerge_btn, redo_btn, xml_btn, json_btn]
         for index, button in enumerate(action_buttons):
@@ -168,6 +174,10 @@ class MainWindow(QMainWindow):
         root.addWidget(self.openrouter_box)
 
         self.viewer = PDFViewer()
+        self.html_preview = QTextBrowser()
+        self.html_preview.setOpenLinks(False)
+        self.html_preview.anchorClicked.connect(self._select_preview_block)
+        self.html_preview.setPlaceholderText("HTML reading-order preview will appear after loading a PDF.")
         self.tree = StructureTree()
         self.props = PropertiesPanel()
         self.viewer.setMinimumSize(0, 0)
@@ -210,9 +220,11 @@ class MainWindow(QMainWindow):
         self.body_splitter.addWidget(viewer_column)
         self.body_splitter.addWidget(tree_column)
         self.body_splitter.addWidget(self.props)
+        self.body_splitter.addWidget(self.html_preview)
         self.body_splitter.setStretchFactor(0, 3)
         self.body_splitter.setStretchFactor(1, 2)
         self.body_splitter.setStretchFactor(2, 1)
+        self.body_splitter.setStretchFactor(3, 2)
         self.body_splitter.setChildrenCollapsible(False)
         root.addWidget(self.body_splitter, 1)
 
@@ -327,26 +339,34 @@ class MainWindow(QMainWindow):
         selected_blocks = [block for block in self.document.blocks if block.id in self._selected_block_ids]
         if len(selected_blocks) >= 2:
             valid_continuation, _reason = self._selection_looks_like_paragraph_continuation(selected_blocks)
-            if valid_continuation:
+            if valid_continuation and not self._has_html_preview_continuation(
+                {block.id for block in selected_blocks}
+            ):
                 QMessageBox.information(
                     self,
                     "Continue paragraph first",
-                    "Preview only draws the continuation arrow. Click Continue Paragraph to merge the selected blocks into one exportable paragraph before generating XML.",
+                    "Click Continue Paragraph to add the selected blocks to the HTML preview before generating XML.",
                 )
                 return
         self._update_document_model()
-        validation_errors = self.validator.validate_document(self.document)
+        export_document = self._document_with_html_preview_continuations()
+        validation_errors = self.validator.validate_document(export_document)
         if validation_errors:
             for error in validation_errors:
                 self._log(f"Document validation error: {error.message}")
-        segments = self.document.metadata.get("article_segments", [])
-        documents = [self._document_for_segment(segment) for segment in segments]
+        segments = export_document.metadata.get("article_segments", [])
+        documents = [self._document_for_segment(segment, export_document) for segment in segments]
         if len(documents) <= 1:
-            documents = [self.document]
+            documents = [export_document]
+        output_dir = self._choose_output_directory(
+            "Choose XML output folder", self.config.generated_xml_dir
+        )
+        if output_dir is None:
+            return
         output_paths: list[Path] = []
         for index, segment_document in enumerate(documents, start=1):
             filename = "article.xml" if len(documents) == 1 else f"article_{index:03d}.xml"
-            output_path = self.config.generated_xml_dir / filename
+            output_path = output_dir / filename
             generated_path = self.generator.generate(segment_document, output_path)
             output_paths.append(generated_path)
             errors = self.validator.validate(generated_path)
@@ -361,19 +381,226 @@ class MainWindow(QMainWindow):
         if self.document is None:
             QMessageBox.information(self, "No document", "Load a PDF first.")
             return
-        output_path = self.config.output_dir / "document.json"
-        layout_path = self.config.output_dir / "layout.json"
-        report_path = self.config.output_dir / "pipeline_report.json"
-        self.document.to_json(output_path)
+        output_dir = self._choose_output_directory(
+            "Choose JSON output folder", self.config.output_dir
+        )
+        if output_dir is None:
+            return
+        self._update_document_model()
+        export_document = self._document_with_html_preview_continuations()
+        output_path = output_dir / "document.json"
+        layout_path = output_dir / "layout.json"
+        report_path = output_dir / "pipeline_report.json"
+        export_document.to_json(output_path)
         layout_path.parent.mkdir(parents=True, exist_ok=True)
-        layout_path.write_text(json.dumps(self.document.to_layout_json(), indent=2, ensure_ascii=False), encoding="utf-8")
-        report_path.write_text(json.dumps(self.document.to_pipeline_report(), indent=2, ensure_ascii=False), encoding="utf-8")
+        layout_path.write_text(json.dumps(export_document.to_layout_json(), indent=2, ensure_ascii=False), encoding="utf-8")
+        report_path.write_text(json.dumps(export_document.to_pipeline_report(), indent=2, ensure_ascii=False), encoding="utf-8")
         self._log(f"JSON written to {output_path}")
         self._log(f"Layout JSON written to {layout_path}")
         self._log(f"Pipeline report written to {report_path}")
 
+    def _choose_output_directory(self, title: str, initial_dir: Path) -> Path | None:
+        """Ask the user where an export should be written."""
+
+        path = QFileDialog.getExistingDirectory(self, title, str(initial_dir.resolve()))
+        return Path(path) if path else None
+
+    def _has_html_preview_continuation(self, block_ids: set[str]) -> bool:
+        return any(set(group) == block_ids for group in self._html_preview_merges)
+
+    def _blocks_with_html_preview_continuations(self, blocks):
+        """Create export-only blocks that collapse the active HTML continuation groups."""
+
+        blocks_by_id = {block.id: block for block in blocks}
+        groups: list[list] = []
+        grouped_ids: set[str] = set()
+        for group in self._html_preview_merges:
+            group_blocks = self._sort_reading_order(
+                [blocks_by_id[block_id] for block_id in group if block_id in blocks_by_id]
+            )
+            if len(group_blocks) != len(group) or len(group_blocks) < 2:
+                continue
+            groups.append(group_blocks)
+            grouped_ids.update(block.id for block in group_blocks)
+
+        virtual_blocks = {}
+        for group_blocks in groups:
+            first = group_blocks[0]
+            source_ids = [block.id for block in group_blocks]
+            source_line_ids = [
+                str(line_id)
+                for block in group_blocks
+                for line_id in block.metadata.get("source_line_ids", [block.id])
+            ]
+            roles = {block.role for block in group_blocks}
+            semantic_roles = roles - {"unclassified"}
+            if len(semantic_roles) == 1:
+                merged_role = semantic_roles.pop()
+            elif len(roles) == 1:
+                merged_role = roles.pop()
+            else:
+                merged_role = "unclassified"
+            metadata = dict(first.metadata)
+            metadata.update(
+                {
+                    "preview_source_block_ids": source_ids,
+                    "source_line_ids": list(dict.fromkeys(source_line_ids)),
+                    "is_paragraph_unit": True,
+                    "merge_source": "html_preview_continuation",
+                    "continuation_from": source_ids[:-1],
+                    "continuation_to": source_ids[-1],
+                }
+            )
+            virtual_blocks[first.id] = replace(
+                first,
+                text=" ".join(" ".join(block.text.split()) for block in group_blocks),
+                bbox=[
+                    min(block.bbox[0] for block in group_blocks),
+                    min(block.bbox[1] for block in group_blocks),
+                    max(block.bbox[2] for block in group_blocks),
+                    max(block.bbox[3] for block in group_blocks),
+                ],
+                x=min(block.x for block in group_blocks),
+                y=min(block.y for block in group_blocks),
+                width=max(block.bbox[2] for block in group_blocks) - min(block.bbox[0] for block in group_blocks),
+                height=max(block.bbox[3] for block in group_blocks) - min(block.bbox[1] for block in group_blocks),
+                confidence=min(block.confidence for block in group_blocks),
+                role=merged_role,
+                metadata=metadata,
+            )
+
+        result = []
+        for block in self._sort_reading_order(blocks):
+            if block.id in grouped_ids:
+                virtual_block = virtual_blocks.get(block.id)
+                if virtual_block is not None:
+                    result.append(virtual_block)
+                continue
+            result.append(replace(block, metadata=dict(block.metadata)))
+        return self._sort_reading_order(result)
+
+    def _document_with_html_preview_continuations(self) -> Document:
+        """Build an export document without changing the editable block model."""
+
+        if self.document is None:
+            raise RuntimeError("Load a PDF first.")
+        source = self.document
+        blocks = self._blocks_with_html_preview_continuations(source.blocks)
+        visible_blocks = [block for block in blocks if not self._looks_like_footer_noise(block)]
+        author_blocks = [
+            block for block in visible_blocks if block.role in {"author", "corresponding_author"}
+        ]
+        affiliation_blocks = [block for block in visible_blocks if block.role == "affiliation"]
+        linked = self.linker.link_from_blocks(author_blocks, affiliation_blocks)
+        return Document(
+            title=self._compose_title(visible_blocks),
+            authors=linked.authors,
+            corresponding_author=linked.corresponding_author,
+            affiliations=linked.affiliations,
+            abstract="\n".join(
+                self._sanitize_xml_text(block.text)
+                for block in visible_blocks
+                if block.role == "abstract" and block.text.strip()
+            ),
+            raw_blocks=[replace(block, metadata=dict(block.metadata)) for block in source.raw_blocks],
+            blocks=blocks,
+            paragraphs=(
+                self.paragraph_reconstructor.propose(source.raw_blocks)
+                + self.paragraph_reconstructor.accepted_from_blocks(blocks)
+            ),
+            zones=list(source.zones),
+            figures=list(source.figures),
+            tables=list(source.tables),
+            references=list(source.references),
+            metadata=dict(source.metadata),
+        )
+
     def _log(self, message: str) -> None:
         self.log.append(message)
+
+    def _update_html_preview(self) -> None:
+        """Render blocks in backend reading order as selectable HTML."""
+
+        if self.document is None:
+            self.html_preview.clear()
+            return
+        parts = [
+            "<style>body{font-family:Arial;color:#222;background:#fff;}"
+            "p{margin:0 0 10px;padding:7px;border:1px solid #ddd;}"
+            ".selected{border:2px solid #2d75d6;background:#eef5ff;}"
+            ".continued{border:2px solid #218838;background:#eef9f0;}"
+            ".meta{color:#666;font-size:11px;}</style>"
+            "<h3>Reading Order Preview</h3>"
+        ]
+        ordered_blocks = self._sort_reading_order(self.document.blocks)
+        blocks_by_id = {block.id: block for block in ordered_blocks}
+        reading_order = {block.id: index for index, block in enumerate(ordered_blocks)}
+        merged_ids = {block_id for group in self._html_preview_merges for block_id in group}
+        preview_items: list[tuple[tuple[str, ...], str, int, str]] = []
+        for group in self._html_preview_merges:
+            group_blocks = self._sort_reading_order([blocks_by_id[block_id] for block_id in group if block_id in blocks_by_id])
+            if not group_blocks:
+                continue
+            preview_items.append(
+                (
+                    group,
+                    " ".join(" ".join(block.text.split()) for block in group_blocks),
+                    group_blocks[0].page,
+                    f"merged {len(group_blocks)} blocks",
+                )
+            )
+        for block in ordered_blocks:
+            if block.id not in merged_ids:
+                preview_items.append(((block.id,), " ".join(block.text.split()), block.page, block.role))
+
+        preview_items.sort(key=lambda item: min(reading_order[block_id] for block_id in item[0] if block_id in reading_order))
+        for index, (block_ids, text, page, role) in enumerate(preview_items, start=1):
+            selected = " selected" if any(block_id in self._selected_block_ids for block_id in block_ids) else ""
+            if len(block_ids) == 1:
+                anchor = f"block-{block_ids[0]}"
+                label = (
+                    f'<a name="{escape(anchor)}"></a><a href="select:{escape(block_ids[0])}">'
+                    f'<span class="meta">{index}. page {page} | {escape(role)}</span></a>'
+                )
+                css_class = selected
+            else:
+                anchor = f"continued-{'-'.join(block_ids)}"
+                label = f'<a name="{escape(anchor)}"></a><span class="meta">CONTINUED | {index}. page {page} | {escape(role)}</span>'
+                css_class = f"continued{selected}"
+            parts.append(
+                f'<p class="{css_class}">{label}'
+                f'<br>{escape(text)}</p>'
+            )
+        self.html_preview.setHtml("".join(parts))
+
+    def _select_preview_block(self, url: QUrl) -> None:
+        """Select a block clicked in the HTML preview."""
+
+        if url.scheme() != "select" or self.document is None:
+            return
+        block_id = url.path().lstrip("/") or url.host()
+        block = next((item for item in self.document.blocks if item.id == block_id), None)
+        if block is None:
+            return
+        additive = bool(QApplication.keyboardModifiers() & Qt.ControlModifier)
+        if not additive:
+            self._selected_zone_id = None
+            self._selected_zone_ids.clear()
+            self.viewer.set_selected_zones(set())
+            self._selected_block_ids = {block.id}
+        elif block.id in self._selected_block_ids:
+            self._selected_block_ids.remove(block.id)
+        else:
+            self._selected_block_ids.add(block.id)
+
+        active_block_id = block.id if block.id in self._selected_block_ids else None
+        self.viewer.set_selected_blocks(self._selected_block_ids, active_block_id)
+        self._sync_tree_selection()
+        self._update_selection_status()
+        self._update_selection_panel()
+        if active_block_id:
+            self._select_block_by_id(block.id, preserve_selection=True)
+        self._update_html_preview()
 
     def _update_document_model(self) -> None:
         """Build document metadata from user-assigned roles only."""
@@ -402,22 +629,25 @@ class MainWindow(QMainWindow):
         self._rebuild_paragraph_model()
         self._sync_auto_zones()
 
-    def _document_for_segment(self, segment: dict[str, object]) -> Document:
+    def _document_for_segment(
+        self, segment: dict[str, object], source_document: Document | None = None
+    ) -> Document:
         """Build an exportable document view for one detected article range."""
 
-        if self.document is None:
+        source = source_document or self.document
+        if source is None:
             raise RuntimeError("Load a PDF first.")
         start_page = int(segment.get("start_page", 1))
         end_page = int(segment.get("end_page", start_page))
         blocks = [
             replace(block, metadata=dict(block.metadata))
-            for block in self.document.blocks
+            for block in source.blocks
             if start_page <= block.page <= end_page
         ]
         block_ids = {block.id for block in blocks}
         raw_blocks = [
             replace(block, metadata=dict(block.metadata))
-            for block in (self.document.raw_blocks or self.document.blocks)
+            for block in (source.raw_blocks or source.blocks)
             if block.id in block_ids
         ]
         paragraphs = [
@@ -425,10 +655,10 @@ class MainWindow(QMainWindow):
                 paragraph,
                 source_line_ids=[line_id for line_id in paragraph.source_line_ids if line_id in block_ids],
             )
-            for paragraph in self.document.paragraphs
+            for paragraph in source.paragraphs
             if any(line_id in block_ids for line_id in paragraph.source_line_ids)
         ]
-        metadata = dict(self.document.metadata)
+        metadata = dict(source.metadata)
         metadata["abstract_number"] = str(segment.get("abstract_number", "ABSN"))
         metadata["abstract_number_block_ids"] = [str(segment.get("abstract_number_block_id", ""))]
         metadata["article_segment"] = dict(segment)
@@ -443,8 +673,8 @@ class MainWindow(QMainWindow):
         ).strip()
         return Document(
             title=title,
-            authors=list(self.document.authors),
-            affiliations=list(self.document.affiliations),
+            authors=list(source.authors),
+            affiliations=list(source.affiliations),
             abstract="\n".join(
                 self._sanitize_xml_text(block.text)
                 for block in blocks
@@ -453,10 +683,10 @@ class MainWindow(QMainWindow):
             raw_blocks=raw_blocks,
             blocks=blocks,
             paragraphs=paragraphs,
-            zones=[zone for zone in self.document.zones if start_page <= zone.page <= end_page],
-            figures=[figure for figure in self.document.figures if start_page <= figure.get("page", 0) <= end_page],
-            tables=[table for table in self.document.tables if start_page <= table.get("page", 0) <= end_page],
-            references=list(self.document.references),
+            zones=[zone for zone in source.zones if start_page <= zone.page <= end_page],
+            figures=[figure for figure in source.figures if start_page <= figure.get("page", 0) <= end_page],
+            tables=[table for table in source.tables if start_page <= table.get("page", 0) <= end_page],
+            references=list(source.references),
             metadata=metadata,
         )
 
@@ -694,6 +924,40 @@ class MainWindow(QMainWindow):
             return
         self._apply_manual_merge(selected_blocks, merge_source="manual", join_with_space=False, action_label="Merged")
 
+    def _continue_blocks_in_html_preview(self, selected_ids: set[str]) -> None:
+        """Show selected paragraph units as one item without changing the document."""
+
+        if self.document is None:
+            return
+        selected_blocks = [block for block in self.document.blocks if block.id in selected_ids]
+        if len(selected_blocks) < 2:
+            QMessageBox.information(self, "Select blocks", "Select at least two blocks to merge.")
+            return
+        group = tuple(block.id for block in self._sort_reading_order(selected_blocks))
+        self._html_preview_merges = [
+            existing_group
+            for existing_group in self._html_preview_merges
+            if not set(existing_group).intersection(group)
+        ]
+        self._html_preview_merges.append(group)
+        self._selected_zone_id = None
+        self._selected_zone_ids.clear()
+        self.viewer.set_selected_zones(set())
+        continuation_links = [(group[index], group[index + 1]) for index in range(len(group) - 1)]
+        self.viewer.set_selected_blocks(self._selected_block_ids, group[0])
+        self.viewer.set_continuation_links(continuation_links)
+        self._sync_tree_selection()
+        self._update_selection_status()
+        self._update_selection_panel()
+        self._update_html_preview()
+        self.html_preview.scrollToAnchor(f"continued-{'-'.join(group)}")
+        self._log(f"Continued {len(group)} paragraph blocks in the HTML preview.")
+        QMessageBox.information(
+            self,
+            "Paragraph continued",
+            f"The {len(group)} selected paragraph blocks are now combined in the HTML preview. The PDF blocks and exported document are unchanged.",
+        )
+
     def continue_selected_paragraphs(self) -> None:
         """Collapse selected merged paragraphs into a single continuation block."""
 
@@ -709,12 +973,7 @@ class MainWindow(QMainWindow):
         if not valid:
             QMessageBox.information(self, "Invalid selection", reason)
             return
-        self._apply_manual_merge(
-            selected_blocks,
-            merge_source="paragraph_continuation",
-            join_with_space=True,
-            action_label="Continued",
-        )
+        self._continue_blocks_in_html_preview({block.id for block in selected_blocks})
 
     def show_selected_continuation_arrow(self) -> None:
         """Preview continuation direction between selected paragraph units."""
@@ -963,7 +1222,7 @@ class MainWindow(QMainWindow):
         merged_block = self._merge_blocks(selected_blocks, merge_source=merge_source, join_with_space=join_with_space)
         remaining_blocks = [block for block in self.document.blocks if block.id not in selected_ids]
         remaining_blocks.append(merged_block)
-        remaining_blocks.sort(key=lambda block: (block.page, block.y, block.x))
+        remaining_blocks = self._sort_reading_order(remaining_blocks)
         self.document.blocks = remaining_blocks
         self._selected_block_ids = {merged_block.id}
         self._selected_zone_ids.clear()
@@ -982,6 +1241,7 @@ class MainWindow(QMainWindow):
         self.viewer.set_selected_blocks(self._selected_block_ids, merged_block.id)
         self._update_selection_status()
         self._update_selection_panel()
+        self._update_html_preview()
         self._log(f"{action_label} {len(selected_blocks)} blocks into {merged_block.id}")
         self._select_block_by_id(merged_block.id, preserve_selection=True)
 
@@ -1000,7 +1260,6 @@ class MainWindow(QMainWindow):
                 return False, "Selected blocks must already be merged paragraph units."
             if len(block.text.strip().split()) < 8:
                 return False, "Selected blocks are too short to continue as a paragraph."
-
         first_text = blocks[0].text.strip().lower()
         if re.match(r"^(abstract|flash talks?|poster|oral presentation|session|symposium)\b", first_text):
             return False, "The first selected block looks like a header or section label."
@@ -1008,7 +1267,11 @@ class MainWindow(QMainWindow):
             return False, "The first selected block looks like metadata, not a paragraph."
 
         for first, second in zip(blocks, blocks[1:]):
-            if first.page != second.page:
+            if second.page - first.page > 1:
+                return False, "Selected paragraphs skip a page and are not a continuous reading sequence."
+            if second.page != first.page:
+                if not self._looks_like_page_continuation(first, second):
+                    return False, "The selected paragraphs do not look like a page continuation."
                 continue
             vertical_gap = max(0.0, second.y - (first.y + first.height))
             right_column_continuation = second.x > first.x + first.width * 0.75
@@ -1024,8 +1287,38 @@ class MainWindow(QMainWindow):
                 return False, "Selected blocks should share the same style."
         return True, ""
 
+    def _is_continuation_boundary(self, block) -> bool:
+        """Reject text that must start or end a logical section instead."""
+
+        text = " ".join(block.text.split()).strip()
+        lower = text.lower()
+        if not text or self._looks_like_footer_noise(block):
+            return True
+        if re.match(
+            r"^(background|aims?|methods?|results?|discussion|conclusions?|summary(?:/| )|references?|acknowledg)",
+            lower,
+        ):
+            return True
+        if re.match(r"^(doi:|https?://|www\.)", lower):
+            return True
+        return bool(block.role in {"title", "author", "corresponding_author", "affiliation"})
+
+    def _looks_like_page_continuation(self, first, second) -> bool:
+        """Accept an explicitly selected continuation across consecutive pages."""
+
+        if second.page <= first.page or second.page - first.page != 1:
+            return False
+        previous_text = " ".join(first.text.split()).rstrip()
+        next_text = " ".join(second.text.split()).lstrip()
+        return bool(previous_text and next_text)
+
     def _sort_paragraph_continuation_blocks(self, blocks) -> list:
         """Sort selected paragraph units in natural reading order."""
+
+        return self._sort_reading_order(blocks)
+
+    def _sort_reading_order(self, blocks) -> list:
+        """Sort blocks by page, then column, then top-to-bottom position."""
 
         ordered: list = []
         pages: dict[int, list] = {}
@@ -1087,8 +1380,7 @@ class MainWindow(QMainWindow):
                 if block_rect in zone_rects or _intersects(block_rect, zone_bounds):
                     blocks.append(block)
                     seen.add(block.id)
-        blocks.sort(key=lambda block: (block.page, block.y, block.x))
-        return blocks
+        return self._sort_reading_order(blocks)
 
     def _select_blocks_from_selected_zones(self) -> None:
         """Expand the current selection to include blocks covered by selected zones."""
@@ -1415,6 +1707,16 @@ class MainWindow(QMainWindow):
             self._select_block_by_id(block_id, preserve_selection=True)
         else:
             self.props.set_role(None)
+        self._update_html_preview()
+        self.html_preview.scrollToAnchor(self._html_preview_anchor_for_block(block_id))
+
+    def _html_preview_anchor_for_block(self, block_id: str) -> str:
+        """Return the preview location for a source block or its continued group."""
+
+        for group in self._html_preview_merges:
+            if block_id in group:
+                return f"continued-{'-'.join(group)}"
+        return f"block-{block_id}"
 
     def _sync_tree_selection(self) -> None:
         self.tree.blockSignals(True)
@@ -1478,6 +1780,7 @@ class MainWindow(QMainWindow):
     def _load_pdf_path(self, path: str) -> None:
         self.document = self.extractor.extract(path)
         self._undo_stack.clear()
+        self._html_preview_merges.clear()
         self._active_zone_move_undo_id = None
         results = self.classifier.classify_blocks(self.document.blocks)
         for block, result in zip(self.document.blocks, results, strict=False):
@@ -1494,6 +1797,7 @@ class MainWindow(QMainWindow):
         self._populate_tree()
         self._sync_auto_zones()
         self.viewer.set_zones([asdict(zone) for zone in self.document.zones])
+        self._update_html_preview()
         report_path = self.config.output_dir / "pipeline_report.json"
         report_path.write_text(json.dumps(self.document.to_pipeline_report(), indent=2, ensure_ascii=False), encoding="utf-8")
         self._log(f"Loaded {path}")
@@ -1662,6 +1966,9 @@ class MainWindow(QMainWindow):
         block_id = next(iter(self._selected_block_ids))
         block = next((b for b in self.document.blocks if b.id == block_id), None)
         if block is None:
+            return
+
+        if block.role == new_role:
             return
 
         block.role = new_role
