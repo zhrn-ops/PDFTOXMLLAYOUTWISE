@@ -102,6 +102,7 @@ class Document:
             "authors": [
                 {
                     "initials": author.initials,
+                    "given_names": author.given_names,
                     "surname": author.surname,
                     "display_name": author.display_name,
                     "affiliation_ids": list(author.affiliation_ids),

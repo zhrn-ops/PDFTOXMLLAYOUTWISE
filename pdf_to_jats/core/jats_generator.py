@@ -215,8 +215,11 @@ class JATSGenerator:
             return "", ""
         if len(parts) == 1:
             return parts[0][:1].upper() + ".", parts[0]
-        initials = "".join(f"{part[0].upper()}." for part in parts[:-1])
-        return initials, parts[-1]
+        particles = {"da", "das", "de", "del", "della", "der", "di", "do", "dos", "du", "la", "le", "van", "vander", "von"}
+        surname_start = next((index for index, part in enumerate(parts[1:], start=1) if part.rstrip(".").lower() in particles), len(parts) - 1)
+        given = parts[:surname_start]
+        initials = "".join(f"{part[0].upper()}." for part in given)
+        return initials, " ".join(parts[surname_start:])
 
     def _split_affiliation(self, text: str) -> tuple[str, str, str]:
         parts = [part.strip() for part in text.split(",") if part.strip()]

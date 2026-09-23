@@ -244,7 +244,8 @@ class PDFExtractor:
             return "", []
 
         patterns = [
-            r"^\s*([A-Z0-9][A-Z0-9./-]{1,30})\s*(?:\||\u2502)\s*",
+            r"^\s*\(([A-Z][A-Z0-9./-]{1,30})\)\s+",
+            r"^\s*(?=[A-Z0-9./-]{1,30}\d)([A-Z0-9][A-Z0-9./-]{1,30})\s*(?:\||\u2502)\s*",
             r"^\s*(\d{3,6})\s*$",
             r"\b(?:abstract\s*(?:no\.?|number|nr\.?|id)?|absn)\s*[:#-]?\s*([A-Z0-9][A-Z0-9./-]{1,30})\b",
         ]
@@ -254,7 +255,10 @@ class PDFExtractor:
                 match = re.search(pattern, cleaned, flags=re.IGNORECASE)
                 if match:
                     value = match.group(1).strip(" ,;:.-")
-                    if value and (pattern.startswith("^\\s*(\\d{3,6})") or re.fullmatch(r"[A-Z0-9][A-Z0-9./-]{1,30}", value)):
+                    if value and (value[0].isupper() or value[0].isdigit()) and (
+                        pattern.startswith("^\\s*(\\d{3,6})")
+                        or re.fullmatch(r"[A-Z0-9][A-Z0-9./-]{1,30}", value, flags=re.IGNORECASE)
+                    ):
                         return value, [block.id]
         return "", []
 
@@ -264,7 +268,8 @@ class PDFExtractor:
         markers: list[dict[str, Any]] = []
         seen: set[str] = set()
         patterns = (
-            r"^\s*([A-Z0-9][A-Z0-9./-]{1,30})\s*(?:\||\u2502)\s*",
+            r"^\s*\(([A-Z][A-Z0-9./-]{1,30})\)\s+",
+            r"^\s*(?=[A-Z0-9./-]{1,30}\d)([A-Z0-9][A-Z0-9./-]{1,30})\s*(?:\||\u2502)\s*",
             r"\b(?:abstract\s*(?:no\.?|number|nr\.?|id)?|absn)\s*[:#-]?\s*([A-Z0-9][A-Z0-9./-]{1,30})\b",
         )
         for block in sorted(blocks, key=lambda item: (item.page, item.y, item.x)):
@@ -275,7 +280,7 @@ class PDFExtractor:
                     continue
                 value = match.group(1).strip(" ,;:.-")
                 key = value.casefold()
-                if value and key not in seen:
+                if value and (value[0].isupper() or value[0].isdigit()) and key not in seen:
                     markers.append({"abstract_number": value, "page": block.page, "block_id": block.id})
                     seen.add(key)
                 break

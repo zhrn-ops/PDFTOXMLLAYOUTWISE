@@ -176,6 +176,10 @@ class MainWindow(QMainWindow):
         self.viewer = PDFViewer()
         self.html_preview = QTextBrowser()
         self.html_preview.setOpenLinks(False)
+        self.html_preview.setStyleSheet(
+            "QTextBrowser { background-color: #202020; color: #f2f2f2; "
+            "border: 1px solid #606060; }"
+        )
         self.html_preview.anchorClicked.connect(self._select_preview_block)
         self.html_preview.setPlaceholderText("HTML reading-order preview will appear after loading a PDF.")
         self.tree = StructureTree()
@@ -196,6 +200,8 @@ class MainWindow(QMainWindow):
         self.tree.itemSelectionChanged.connect(self._on_tree_selection_changed)
         self.tree.itemChanged.connect(self._on_tree_item_changed)
         self.viewer.label.blockSelected.connect(self._on_viewer_block_selected)
+        self.viewer.label.blockRangeSelected.connect(self._on_viewer_block_range_selected)
+        self.viewer.label.blocksRectSelected.connect(self._on_viewer_blocks_rect_selected)
         self.viewer.label.zoneSelected.connect(self._on_viewer_zone_selected)
         self.viewer.label.zoneMoved.connect(self._on_viewer_zone_moved)
         self.viewer.label.zoneCreated.connect(self._on_viewer_zone_created)
@@ -525,11 +531,12 @@ class MainWindow(QMainWindow):
             self.html_preview.clear()
             return
         parts = [
-            "<style>body{font-family:Arial;color:#222;background:#fff;}"
-            "p{margin:0 0 10px;padding:7px;border:1px solid #ddd;}"
-            ".selected{border:2px solid #2d75d6;background:#eef5ff;}"
-            ".continued{border:2px solid #218838;background:#eef9f0;}"
-            ".meta{color:#666;font-size:11px;}</style>"
+            "<style>body{font-family:Arial;color:#f2f2f2;background:#202020;}"
+            "h3{color:#ffffff;}"
+            "p{margin:0 0 10px;padding:7px;border:1px solid #606060;color:#f2f2f2;background:#2b2b2b;}"
+            ".selected{border:2px solid #4ea1ff;background:#183653;color:#ffffff;}"
+            ".continued{border:2px solid #42c767;background:#173d24;color:#ffffff;}"
+            ".meta{color:#bdbdbd;font-size:11px;}</style>"
             "<h3>Reading Order Preview</h3>"
         ]
         ordered_blocks = self._sort_reading_order(self.document.blocks)
@@ -671,6 +678,13 @@ class MainWindow(QMainWindow):
             title,
             count=1,
         ).strip()
+        title = re.sub(
+            r"^\s*\([A-Z][A-Z0-9./-]{1,30}\)\s+",
+            "",
+            title,
+            count=1,
+            flags=re.IGNORECASE,
+        ).strip()
         return Document(
             title=title,
             authors=list(source.authors),
@@ -736,7 +750,10 @@ class MainWindow(QMainWindow):
             grouped.append(block)
             baseline = max(baseline, block.y + block.height)
         parts = [self._sanitize_xml_text(block.text).strip() for block in grouped if self._sanitize_xml_text(block.text).strip()]
-        return " ".join(parts) if parts else self._sanitize_xml_text(top.text)
+        title = " ".join(parts) if parts else self._sanitize_xml_text(top.text)
+        # Conference abstracts commonly prefix the title with an identifier such
+        # as "(S100)". Keep it in extraction metadata, not in the article title.
+        return re.sub(r"^\s*\([A-Z][A-Z0-9./-]{1,30}\)\s+", "", title, count=1, flags=re.IGNORECASE).strip()
 
     def _populate_tree(self) -> None:
         """Populate the structure tree with detected blocks."""
@@ -1688,6 +1705,8 @@ class MainWindow(QMainWindow):
         if self.document is None:
             return
         if not additive:
+            self._range_anchor_block_id = block_id
+        if not additive:
             self._selected_zone_id = None
             self._selected_zone_ids.clear()
             self.viewer.set_selected_zones(set())
@@ -1709,6 +1728,54 @@ class MainWindow(QMainWindow):
             self.props.set_role(None)
         self._update_html_preview()
         self.html_preview.scrollToAnchor(self._html_preview_anchor_for_block(block_id))
+
+    def _on_viewer_block_range_selected(self, block_id: str) -> None:
+        """Select the inclusive document-order range from the current anchor."""
+        if self.document is None:
+            return
+        if not getattr(self, "_range_anchor_block_id", None):
+            self._on_viewer_block_selected(block_id, False)
+            return
+        ordered = sorted(self.document.blocks, key=lambda block: (block.page, block.y, block.x))
+        ids = [block.id for block in ordered]
+        try:
+            start = ids.index(self._range_anchor_block_id)
+            end = ids.index(block_id)
+        except ValueError:
+            self._on_viewer_block_selected(block_id, False)
+            return
+        if start > end:
+            start, end = end, start
+        self._selected_zone_id = None
+        self._selected_zone_ids.clear()
+        self._selected_block_ids = set(ids[start : end + 1])
+        self.viewer.set_selected_blocks(self._selected_block_ids, block_id)
+        self.viewer.set_selected_zones(set())
+        self._sync_tree_selection()
+        self._update_selection_status()
+        self._update_selection_panel()
+        self._select_block_by_id(block_id, preserve_selection=True)
+        self._update_html_preview()
+        self.html_preview.scrollToAnchor(self._html_preview_anchor_for_block(block_id))
+
+    def _on_viewer_blocks_rect_selected(self, block_ids: list) -> None:
+        """Replace the merge selection with blocks intersecting a drag rectangle."""
+        if self.document is None:
+            return
+        selected_ids = {str(block_id) for block_id in block_ids}
+        self._selected_block_ids = selected_ids
+        self._selected_zone_id = None
+        self._selected_zone_ids.clear()
+        self.viewer.set_selected_blocks(selected_ids, next(iter(selected_ids), None))
+        self.viewer.set_selected_zones(set())
+        self._sync_tree_selection()
+        self._update_selection_status()
+        self._update_selection_panel()
+        self._update_html_preview()
+        if selected_ids:
+            primary_id = next((block.id for block in self.document.blocks if block.id in selected_ids), None)
+            if primary_id:
+                self._select_block_by_id(primary_id, preserve_selection=True)
 
     def _html_preview_anchor_for_block(self, block_id: str) -> str:
         """Return the preview location for a source block or its continued group."""
@@ -1734,7 +1801,7 @@ class MainWindow(QMainWindow):
         block_count = len(self._selected_block_ids)
         zone_count = len(self._selected_zone_ids)
         self.tree_hint.setText(
-            f"Selected blocks: {block_count}; zones: {zone_count}. Use Ctrl-click in the tree or PDF view to select multiple."
+            f"Selected blocks: {block_count}; zones: {zone_count}. Use Ctrl-click for individual blocks or Ctrl+Shift-click for a range."
         )
 
     def _update_selection_panel(self) -> None:

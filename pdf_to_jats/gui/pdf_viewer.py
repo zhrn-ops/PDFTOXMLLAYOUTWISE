@@ -6,15 +6,17 @@ from pathlib import Path
 from typing import Any
 
 import fitz
-from PySide6.QtCore import QPointF, Qt, Signal
+from PySide6.QtCore import QPointF, QRect, Qt, Signal
 from PySide6.QtGui import QColor, QBrush, QImage, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QRubberBand, QScrollArea, QVBoxLayout, QWidget
 
 
 class PdfPageLabel(QLabel):
     """Clickable page renderer with block and zone interaction."""
 
     blockSelected = Signal(str, bool)
+    blockRangeSelected = Signal(str)
+    blocksRectSelected = Signal(list)
     blockMoved = Signal(str, list)
     blockEditFinished = Signal(str)
     zoneSelected = Signal(str, bool)
@@ -35,17 +37,24 @@ class PdfPageLabel(QLabel):
         self._draw_start: QPointF | None = None
         self._draw_current: QPointF | None = None
         self._drawing_zone = False
+        self._selection_band = QRubberBand(QRubberBand.Shape.Rectangle, self)
+        self._selection_band.setStyleSheet("QRubberBand { border: 1px solid #4ea1ff; background: rgba(78, 161, 255, 45); }")
         self.setMouseTracking(True)
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
-        additive = bool(event.modifiers() & Qt.ControlModifier)
+        modifiers = event.modifiers()
+        range_select = bool(modifiers & Qt.ControlModifier and modifiers & Qt.ShiftModifier)
+        additive = bool(modifiers & Qt.ControlModifier) and not range_select
         hit = self._hit_test(event.position() if hasattr(event, "position") else event.pos(), prefer_blocks=additive)
         if hit:
             kind, item_id = hit.split(":", 1)
             if kind == "handle":
                 owner_id, handle_name = item_id.split(":", 1)
                 if self._is_block_handle(owner_id):
-                    self.blockSelected.emit(owner_id, additive)
+                    if range_select:
+                        self.blockRangeSelected.emit(owner_id)
+                    else:
+                        self.blockSelected.emit(owner_id, additive)
                     self._block_drag_handle = handle_name
                     self._block_drag_id = owner_id
                     self._block_drag_start = event.position() if hasattr(event, "position") else event.pos()
@@ -65,7 +74,10 @@ class PdfPageLabel(QLabel):
                 self._zone_drag_start = event.position() if hasattr(event, "position") else event.pos()
                 self._zone_drag_bbox = self._current_zone_bbox(item_id)
             else:
-                self.blockSelected.emit(item_id, additive)
+                if range_select:
+                    self.blockRangeSelected.emit(item_id)
+                else:
+                    self.blockSelected.emit(item_id, additive)
                 if self._block_is_adjustable(item_id):
                     self._block_drag_id = item_id
                     self._block_drag_start = event.position() if hasattr(event, "position") else event.pos()
@@ -73,9 +85,11 @@ class PdfPageLabel(QLabel):
             event.accept()
             return
         if event.button() == Qt.LeftButton:
-            self._drawing_zone = True
             self._draw_start = event.position() if hasattr(event, "position") else event.pos()
             self._draw_current = self._draw_start
+            self._drawing_zone = True
+            self._selection_band.setGeometry(QRect(int(self._draw_start.x()), int(self._draw_start.y()), 1, 1))
+            self._selection_band.show()
             event.accept()
             return
         super().mousePressEvent(event)
@@ -128,6 +142,11 @@ class PdfPageLabel(QLabel):
             return
         if self._drawing_zone and self._draw_start:
             self._draw_current = event.position() if hasattr(event, "position") else event.pos()
+            x0 = min(self._draw_start.x(), self._draw_current.x())
+            y0 = min(self._draw_start.y(), self._draw_current.y())
+            x1 = max(self._draw_start.x(), self._draw_current.x())
+            y1 = max(self._draw_start.y(), self._draw_current.y())
+            self._selection_band.setGeometry(QRect(int(x0), int(y0), max(1, int(x1 - x0)), max(1, int(y1 - y0))))
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -154,7 +173,23 @@ class PdfPageLabel(QLabel):
             x1 = max(self._draw_start.x(), self._draw_current.x()) / scale
             y1 = max(self._draw_start.y(), self._draw_current.y()) / scale
             if abs(x1 - x0) > 2 and abs(y1 - y0) > 2:
-                self.zoneCreated.emit([x0, y0, x1, y1])
+                selected_ids = []
+                display_rect = [
+                    min(self._draw_start.x(), self._draw_current.x()),
+                    min(self._draw_start.y(), self._draw_current.y()),
+                    max(self._draw_start.x(), self._draw_current.x()),
+                    max(self._draw_start.y(), self._draw_current.y()),
+                ]
+                for region in self.property("blockRegions") or []:
+                    rect = region.get("rect")
+                    if region.get("kind") != "block" or not rect:
+                        continue
+                    if rect[0] <= display_rect[2] and rect[2] >= display_rect[0] and rect[1] <= display_rect[3] and rect[3] >= display_rect[1]:
+                        selected_ids.append(str(region.get("id")))
+                self.blocksRectSelected.emit(selected_ids)
+            else:
+                self.blocksRectSelected.emit([])
+        self._selection_band.hide()
         self._drawing_zone = False
         self._draw_start = None
         self._draw_current = None

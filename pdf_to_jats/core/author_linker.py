@@ -22,6 +22,11 @@ class LinkedAuthors:
 class AuthorLinker:
     """Link authors to affiliations using simple graph heuristics."""
 
+    SURNAME_PARTICLES = {
+        "da", "das", "de", "del", "della", "der", "di", "do", "dos",
+        "du", "la", "le", "van", "vander", "von",
+    }
+
     def link(self, authors_text: list[str], affiliations_text: list[str]) -> LinkedAuthors:
         return self.link_from_texts(authors_text, affiliations_text)
 
@@ -54,7 +59,12 @@ class AuthorLinker:
 
     def link_from_texts(self, authors_text: list[str], affiliations_text: list[str]) -> LinkedAuthors:
         affiliation_texts = self._split_affiliation_list(affiliations_text)
-        affiliations = [Affiliation(id=str(i + 1), text=text) for i, text in enumerate(affiliation_texts)]
+        affiliations = []
+        for index, text in enumerate(affiliation_texts, start=1):
+            match = re.match(r"\s*(\d+)\s+", text)
+            affiliation_id = match.group(1) if match else str(index)
+            affiliation_text = text[match.end():].strip() if match else text
+            affiliations.append(Affiliation(id=affiliation_id, text=affiliation_text))
         authors: list[Author] = []
         for text in authors_text:
             for author_text in self._split_author_list(text):
@@ -63,16 +73,15 @@ class AuthorLinker:
                     continue
                 if markers:
                     affiliation_ids = self._resolve_affiliation_ids(markers, affiliations)
-                elif affiliations:
-                    affiliation_ids = [aff.id for aff in affiliations]
                 else:
                     affiliation_ids = []
-                initials, surname = self._split_name(name or author_text)
+                given_names, initials, surname = self._split_name(name or author_text)
                 authors.append(
                     Author(
                         initials=initials,
                         surname=surname,
                         display_name=name or author_text,
+                        given_names=given_names,
                         affiliation_ids=affiliation_ids,
                     )
                 )
@@ -166,27 +175,27 @@ class AuthorLinker:
             result.append(value)
         return result
 
-    def _split_name(self, full_name: str) -> tuple[str, str]:
+    def _split_name(self, full_name: str) -> tuple[str, str, str]:
         parts = [part for part in full_name.split() if part]
         if not parts:
-            return "", ""
+            return "", "", ""
         if len(parts) == 1:
-            return f"{parts[0][0].upper()}.", parts[0]
-        initials_parts: list[str] = []
-        surname_parts: list[str] = []
-        for part in parts:
-            if re.fullmatch(r"(?:[A-Z]\.)+", part) or re.fullmatch(r"[A-Z]\.", part):
+            return parts[0], f"{parts[0][0].upper()}.", parts[0]
+
+        surname_start = len(parts) - 1
+        for index, part in enumerate(parts[1:], start=1):
+            if part.rstrip(".").lower() in self.SURNAME_PARTICLES:
+                surname_start = index
+                break
+        given_parts = parts[:surname_start]
+        surname_parts = parts[surname_start:]
+        initials_parts = []
+        for part in given_parts:
+            if re.fullmatch(r"(?:[A-Z]\.)+", part):
                 initials_parts.append(part if part.endswith(".") else f"{part}.")
-            elif not initials_parts and len(part) <= 3:
-                initials_parts.append(f"{part[0].upper()}.")
             else:
-                surname_parts.append(part)
-        if not initials_parts:
-            initials_parts = [f"{part[0].upper()}." for part in parts[:-1]]
-            surname_parts = [parts[-1]]
-        if not surname_parts:
-            surname_parts = [parts[-1]]
-        return "".join(initials_parts), " ".join(surname_parts)
+                initials_parts.append(f"{part[0].upper()}.")
+        return " ".join(given_parts), "".join(initials_parts), " ".join(surname_parts)
 
     def _is_valid_author_candidate(self, text: str) -> bool:
         """Reject obvious footer noise and non-name text before author serialization."""

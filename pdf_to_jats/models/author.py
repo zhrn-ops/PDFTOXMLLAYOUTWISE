@@ -12,4 +12,5 @@ class Author:
     initials: str = ""
     surname: str = ""
     display_name: str = ""
+    given_names: str = ""
     affiliation_ids: list[str] = field(default_factory=list)
