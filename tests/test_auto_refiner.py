@@ -1,3 +1,4 @@
+
 from pdf_to_jats.core.auto_refiner import AutoRefiner, is_abstract_heading
 from pdf_to_jats.models.block import TextBlock
 

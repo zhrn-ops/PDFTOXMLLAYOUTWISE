@@ -47,7 +47,12 @@ from pdf_to_jats.gui.properties_panel import PropertiesPanel
 from pdf_to_jats.gui.structure_tree import StructureTree
 from pdf_to_jats.gui.styles import APP_STYLE
 from pdf_to_jats.models.block import reading_order_key
-from pdf_to_jats.models.document import Document, DocumentZone
+from pdf_to_jats.models.document import (
+    Document,
+    DocumentZone,
+    REFINE_ROLES,
+    block_matches_segment,
+)
 from pdf_to_jats.models.paragraph import Paragraph
 from pdf_to_jats.utils.config import load_config, save_openrouter_settings
 
@@ -85,6 +90,8 @@ class MainWindow(QMainWindow):
         self._last_refine_report = None
         self._review_block_ids: list[str] = []
         self._review_index = -1
+        self._finished_segment_keys: list[tuple] = []
+        self._current_segment_key: tuple | None = None
         self.setWindowTitle(self.config.app_name)
         self.setMinimumSize(720, 520)
         self.setStyleSheet(APP_STYLE)
@@ -120,7 +127,36 @@ class MainWindow(QMainWindow):
         xml_btn.clicked.connect(self.generate_xml)
         json_btn = QPushButton("Export JSON...")
         json_btn.clicked.connect(self.export_json)
-        action_buttons = [load_btn, merge_btn, continue_btn, classify_btn, unmerge_btn, redo_btn, xml_btn, json_btn]
+        self.finish_article_btn = QPushButton("Finish Article")
+        self.finish_article_btn.setToolTip(
+            "Export the current article to XML, mark it finished, and lock its fields."
+        )
+        self.finish_article_btn.clicked.connect(self.finish_current_article)
+        self.reopen_article_btn = QPushButton("Reopen Article")
+        self.reopen_article_btn.setToolTip("Unlock a finished article so it can be edited again.")
+        self.reopen_article_btn.clicked.connect(self.reopen_current_article)
+        auto_pipeline_btn = QPushButton("Auto Pipeline")
+        auto_pipeline_btn.setToolTip(
+            "Extract, classify, auto-refine, and export XML to the default folder in one click."
+        )
+        auto_pipeline_btn.clicked.connect(self.run_auto_pipeline)
+        review_btn = QPushButton("Next Review Item")
+        review_btn.setToolTip("Jump to the next block the auto-refiner flagged for review.")
+        review_btn.clicked.connect(self.goto_next_review_item)
+        action_buttons = [
+            load_btn,
+            merge_btn,
+            continue_btn,
+            classify_btn,
+            unmerge_btn,
+            redo_btn,
+            xml_btn,
+            json_btn,
+            auto_pipeline_btn,
+            review_btn,
+            self.finish_article_btn,
+            self.reopen_article_btn,
+        ]
         for index, button in enumerate(action_buttons):
             button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
             actions.addWidget(button, index // 4, index % 4)
@@ -193,6 +229,7 @@ class MainWindow(QMainWindow):
         self.viewer.setMinimumSize(0, 0)
         self.tree.setMinimumSize(0, 0)
         self.props.setMinimumSize(0, 0)
+        self._refresh_article_buttons()
         self.tree_hint = QLabel("Selected blocks: 0")
         self.tree_hint.setWordWrap(True)
         self.selection_hint = QLabel("Merge selection is empty.")
@@ -203,17 +240,7 @@ class MainWindow(QMainWindow):
         self.clear_selection_btn = QPushButton("Clear Selection")
         self.clear_selection_btn.clicked.connect(self.clear_selection)
         self.props.apply_role_btn.clicked.connect(self.apply_selected_block_role)
-        auto_pipeline_btn = QPushButton("Auto Pipeline")
-        auto_pipeline_btn.setToolTip(
-            "Extract, classify, auto-refine, and export XML to the default folder in one click."
-        )
-        auto_pipeline_btn.clicked.connect(self.run_auto_pipeline)
-        review_btn = QPushButton("Next Review Item")
-        review_btn.setToolTip("Jump to the next block the auto-refiner flagged for review.")
-        review_btn.clicked.connect(self.goto_next_review_item)
         self.actions_layout = actions
-        actions.addWidget(auto_pipeline_btn, 1, 0)
-        actions.addWidget(review_btn, 1, 1)
         self.tree.itemSelectionChanged.connect(self._on_tree_selection_changed)
         self.tree.itemChanged.connect(self._on_tree_item_changed)
         self.viewer.label.blockSelected.connect(self._on_viewer_block_selected)
@@ -377,9 +404,24 @@ class MainWindow(QMainWindow):
         if validation_errors:
             for error in validation_errors:
                 self._log(f"Document validation error: {error.message}")
-        segments = export_document.metadata.get("article_segments", [])
+        segments = [
+            segment
+            for segment in export_document.metadata.get("article_segments", [])
+            if self._segment_key(segment) not in self._finished_segment_keys
+        ]
+        if not segments and self._finished_segment_keys:
+            self._log("All detected articles are finished; nothing left to export.")
+            QMessageBox.information(
+                self,
+                "All articles finished",
+                "Every detected article has been finished. Reopen an article to re-export it.",
+            )
+            return
         documents = [self._document_for_segment(segment, export_document) for segment in segments]
-        if len(documents) <= 1:
+        if len(documents) <= 1 and len(export_document.metadata.get("article_segments", [])) <= 1:
+            # Single-article PDFs (or PDFs with no detected segments) keep the
+            # whole-document export; multi-article PDFs export per segment so
+            # finished articles are not re-exported.
             documents = [export_document]
         output_dir = self._choose_output_directory(
             "Choose XML output folder", self.config.generated_xml_dir
@@ -476,7 +518,11 @@ class MainWindow(QMainWindow):
         validation_errors = self.validator.validate_document(export_document)
         for error in validation_errors:
             self._log(f"Document validation error: {error.message}")
-        segments = export_document.metadata.get("article_segments", [])
+        segments = [
+            segment
+            for segment in export_document.metadata.get("article_segments", [])
+            if self._segment_key(segment) not in self._finished_segment_keys
+        ]
         if segments:
             documents = [self._document_for_segment(segment, export_document) for segment in segments]
         else:
@@ -627,6 +673,9 @@ class MainWindow(QMainWindow):
             "p{margin:0 0 10px;padding:7px;border:1px solid #606060;color:#f2f2f2;background:#2b2b2b;}"
             ".selected{border:2px solid #4ea1ff;background:#183653;color:#ffffff;}"
             ".continued{border:2px solid #42c767;background:#173d24;color:#ffffff;}"
+            ".finished{border:1px dashed #8a8a8a;background:#232323;color:#8f8f8f;}"
+            ".finished.selected{border:2px dashed #a0a0a0;background:#2a2a2a;color:#c0c0c0;}"
+            ".finished.continued{border:2px dashed #8a8a8a;background:#232323;color:#8f8f8f;}"
             ".meta{color:#bdbdbd;font-size:11px;}</style>"
             "<h3>Reading Order Preview</h3>"
         ]
@@ -652,19 +701,25 @@ class MainWindow(QMainWindow):
                 preview_items.append(((block.id,), " ".join(block.text.split()), block.page, block.role))
 
         preview_items.sort(key=lambda item: min(reading_order[block_id] for block_id in item[0] if block_id in reading_order))
+        blocks_by_id_all = {block.id: block for block in self.document.blocks}
         for index, (block_ids, text, page, role) in enumerate(preview_items, start=1):
             selected = " selected" if any(block_id in self._selected_block_ids for block_id in block_ids) else ""
+            item_locked = any(
+                bool((blocks_by_id_all.get(block_id) is not None) and (blocks_by_id_all[block_id].metadata or {}).get("article_locked"))
+                for block_id in block_ids
+            )
+            lock_prefix = "🔒 " if item_locked else ""
             if len(block_ids) == 1:
                 anchor = f"block-{block_ids[0]}"
                 label = (
                     f'<a name="{escape(anchor)}"></a><a href="select:{escape(block_ids[0])}">'
-                    f'<span class="meta">{index}. page {page} | {escape(role)}</span></a>'
+                    f'<span class="meta">{lock_prefix}{index}. page {page} | {escape(role)}</span></a>'
                 )
-                css_class = selected
+                css_class = ("finished " if item_locked else "") + selected
             else:
                 anchor = f"continued-{'-'.join(block_ids)}"
-                label = f'<a name="{escape(anchor)}"></a><span class="meta">CONTINUED | {index}. page {page} | {escape(role)}</span>'
-                css_class = f"continued{selected}"
+                label = f'<a name="{escape(anchor)}"></a><span class="meta">{lock_prefix}CONTINUED | {index}. page {page} | {escape(role)}</span>'
+                css_class = ("finished " if item_locked else "") + f"continued{selected}"
             parts.append(
                 f'<p class="{css_class}">{label}'
                 f'<br>{escape(text)}</p>'
@@ -699,6 +754,261 @@ class MainWindow(QMainWindow):
         if active_block_id:
             self._select_block_by_id(block.id, preserve_selection=True)
         self._update_html_preview()
+
+    # ------------------------------------------------------------------
+    # Per-article finish / lock workflow
+    # ------------------------------------------------------------------
+
+    def _document_segments(self) -> list[dict[str, object]]:
+        """Return the article segments detected for the loaded PDF."""
+
+        if self.document is None:
+            return []
+        segments = self.document.metadata.get("article_segments", [])
+        return [segment for segment in segments if isinstance(segment, dict)]
+
+    @staticmethod
+    def _segment_key(segment: dict[str, object] | None) -> tuple | None:
+        """Stable identity for a segment that survives block re-creation."""
+
+        if not segment:
+            return None
+        return (
+            int(segment.get("index", 0)),
+            str(segment.get("abstract_number", "")),
+            int(segment.get("start_page", 0)),
+            int(segment.get("end_page", 0)),
+            tuple(int(column) for column in segment.get("columns") or []),
+        )
+
+    def _segments_with_keys(self) -> list[tuple[dict[str, object], tuple]]:
+        return [(segment, self._segment_key(segment)) for segment in self._document_segments()]
+
+    def _current_segment(self) -> tuple[dict[str, object], tuple] | None:
+        """Return the segment the user is currently working on, if any."""
+
+        if self._current_segment_key is not None:
+            for segment, key in self._segments_with_keys():
+                if key == self._current_segment_key:
+                    return segment, key
+            return None
+        # Fall back to the first segment that is not finished yet.
+        for segment, key in self._segments_with_keys():
+            if key not in self._finished_segment_keys:
+                return segment, key
+        return None
+
+    def _article_locked(self, block) -> bool:
+        """A block is locked when it was finished as part of an article.
+
+        Merged blocks inherit the flag through their first source block's
+        metadata, and mixing locked with unlocked blocks in one merge is
+        rejected by the merge guard, so the flag alone is authoritative.
+        """
+
+        return bool(block.metadata.get("article_locked"))
+
+    def _locked_selection_blocks(self, selected_blocks) -> list:
+        """Return the subset of selected blocks that are finished."""
+
+        return [block for block in selected_blocks if self._article_locked(block)]
+
+    def _warn_locked_blocks(self, locked_blocks) -> None:
+        QMessageBox.information(
+            self,
+            "Article finished",
+            f"{len(locked_blocks)} selected block(s) belong to a finished article.\n"
+            "Use Reopen Article to unlock it before editing.",
+        )
+
+    def _export_segment_document(self, segment: dict[str, object], output_dir: Path) -> Path:
+        """Generate the XML for one article segment without dialogs."""
+
+        self._update_document_model()
+        export_document = self._document_with_html_preview_continuations()
+        segment_document = self._document_for_segment(segment, export_document)
+        index_value = segment.get("index")
+        try:
+            index = int(index_value) if index_value is not None else 0
+        except (TypeError, ValueError):
+            index = 0
+        abstract_number = str(segment.get("abstract_number", "")).strip()
+        if index > 0:
+            filename = f"article_{index:03d}.xml"
+        else:
+            filename = "article.xml"
+        if abstract_number:
+            filename = f"article_{abstract_number}.xml"
+        output_path = output_dir / filename
+        generated_path = self.generator.generate(segment_document, output_path)
+        errors = self.validator.validate(generated_path)
+        if errors:
+            for error in errors:
+                self._log(f"Validation error in {generated_path.name}: {error.message}")
+        else:
+            self._log(f"XML written to {generated_path}")
+        return generated_path
+
+    def _lock_segment_blocks(self, segment: dict[str, object], key: tuple) -> int:
+        """Lock the worked-on fields (title, authors, affiliations, abstract).
+
+        Only blocks inside the segment that carry a classified role are locked;
+        unclassified and noise blocks stay editable. Merged blocks are locked
+        through their source block's inherited metadata.
+        """
+
+        if self.document is None:
+            return 0
+        locked_count = 0
+        for block in self.document.blocks:
+            if not block_matches_segment(block, segment):
+                continue
+            if block.role not in REFINE_ROLES:
+                continue
+            metadata = dict(block.metadata)
+            if metadata.get("article_locked"):
+                continue
+            metadata["article_locked"] = True
+            block.metadata.clear()
+            block.metadata.update(metadata)
+            locked_count += 1
+        if key not in self._finished_segment_keys:
+            self._finished_segment_keys.append(key)
+        return locked_count
+
+    def _unlock_segment_blocks(self, segment: dict[str, object], key: tuple) -> int:
+        """Remove the finished/locked state from a segment's blocks."""
+
+        if self.document is None:
+            return 0
+        unlocked_count = 0
+        for block in self.document.blocks:
+            if not block_matches_segment(block, segment):
+                continue
+            metadata = dict(block.metadata)
+            if not metadata.pop("article_locked", False):
+                continue
+            block.metadata.clear()
+            block.metadata.update(metadata)
+            unlocked_count += 1
+        if key in self._finished_segment_keys:
+            self._finished_segment_keys.remove(key)
+        return unlocked_count
+
+    def finish_current_article(self) -> None:
+        """Export the current article's XML, then lock its fields."""
+
+        if self.document is None:
+            QMessageBox.information(self, "No document", "Load a PDF first.")
+            return
+        current = self._current_segment()
+        if current is None:
+            QMessageBox.information(
+                self,
+                "No article",
+                "No unfinished article was detected in this PDF. Articles are identified by their abstract numbers.",
+            )
+            return
+        segment, key = current
+        if key in self._finished_segment_keys:
+            QMessageBox.information(self, "Already finished", "This article is already finished.")
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Finish article",
+            (
+                f"Finish article {segment.get('abstract_number', '')!r} "
+                f"(pages {segment.get('start_page')}-{segment.get('end_page')})?\n\n"
+                "Its XML will be exported and its fields locked."
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        output_dir = self.config.generated_xml_dir
+        output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            generated_path = self._export_segment_document(segment, output_dir)
+        except Exception as exc:
+            QMessageBox.critical(self, "Export failed", f"The article XML could not be written: {exc}")
+            return
+        locked_count = self._lock_segment_blocks(segment, key)
+        self._current_segment_key = self._next_unfinished_segment_key()
+        self._update_document_model()
+        self.viewer.set_blocks([asdict(block) for block in self.document.blocks])
+        self.viewer.set_zones([asdict(zone) for zone in self.document.zones])
+        self._populate_tree()
+        self._update_html_preview()
+        self._update_selection_panel()
+        self._refresh_article_buttons()
+        self._log(
+            f"Finished article {segment.get('abstract_number', '')}: exported {generated_path.name}; "
+            f"locked {locked_count} block(s)."
+        )
+        QMessageBox.information(
+            self,
+            "Article finished",
+            f"Article {segment.get('abstract_number', '')} was exported to {generated_path.name}\n"
+            f"and {locked_count} field block(s) are now locked.",
+        )
+
+    def reopen_current_article(self) -> None:
+        """Unlock the most recently finished article for further editing."""
+
+        if self.document is None:
+            QMessageBox.information(self, "No document", "Load a PDF first.")
+            return
+        if not self._finished_segment_keys:
+            QMessageBox.information(self, "Nothing to reopen", "No finished article is available to reopen.")
+            return
+        finished = self._segments_with_keys()
+        candidates = [(segment, key) for segment, key in finished if key in self._finished_segment_keys]
+        if not candidates:
+            QMessageBox.information(self, "Nothing to reopen", "No finished article is available to reopen.")
+            return
+        segment, key = candidates[-1]
+        unlocked_count = self._unlock_segment_blocks(segment, key)
+        if self._current_segment_key == key:
+            self._current_segment_key = None
+        self._update_document_model()
+        self.viewer.set_blocks([asdict(block) for block in self.document.blocks])
+        self.viewer.set_zones([asdict(zone) for zone in self.document.zones])
+        self._populate_tree()
+        self._update_html_preview()
+        self._update_selection_panel()
+        self._refresh_article_buttons()
+        self._log(f"Reopened article {segment.get('abstract_number', '')}; unlocked {unlocked_count} block(s).")
+        QMessageBox.information(
+            self,
+            "Article reopened",
+            f"Article {segment.get('abstract_number', '')} was unlocked ({unlocked_count} block(s)).",
+        )
+
+    def _next_unfinished_segment_key(self) -> tuple | None:
+        for _segment, key in self._segments_with_keys():
+            if key not in self._finished_segment_keys:
+                return key
+        return None
+
+    def _refresh_article_buttons(self) -> None:
+        """Reflect the current article state on the finish/reopen buttons."""
+
+        if self.document is None:
+            self.finish_article_btn.setEnabled(False)
+            self.finish_article_btn.setText("Finish Article")
+            self.reopen_article_btn.setEnabled(False)
+            return
+        current = self._current_segment()
+        if current is None:
+            self.finish_article_btn.setEnabled(False)
+            self.finish_article_btn.setText("Finish Article")
+        else:
+            segment, _key = current
+            self.finish_article_btn.setEnabled(True)
+            abstract_number = str(segment.get("abstract_number", "")).strip()
+            self.finish_article_btn.setText(f"Finish {abstract_number}" if abstract_number else "Finish Article")
+        self.reopen_article_btn.setEnabled(bool(self._finished_segment_keys))
 
     def _update_document_model(self) -> None:
         """Build document metadata from user-assigned roles only."""
@@ -744,13 +1054,13 @@ class MainWindow(QMainWindow):
         blocks = [
             replace(block, metadata=dict(block.metadata))
             for block in source.blocks
-            if start_page <= block.page <= end_page
+            if block_matches_segment(block, segment)
         ]
         block_ids = {block.id for block in blocks}
         raw_blocks = [
             replace(block, metadata=dict(block.metadata))
             for block in (source.raw_blocks or source.blocks)
-            if block.id in block_ids
+            if block_matches_segment(block, segment)
         ]
         paragraphs = [
             replace(
@@ -780,10 +1090,20 @@ class MainWindow(QMainWindow):
             count=1,
             flags=re.IGNORECASE,
         ).strip()
+        author_blocks = sorted(
+            (block for block in blocks if block.role in {"author", "corresponding_author"}),
+            key=reading_order_key,
+        )
+        affiliation_blocks = sorted(
+            (block for block in blocks if block.role == "affiliation"),
+            key=reading_order_key,
+        )
+        linked = self.linker.link_from_blocks(author_blocks, affiliation_blocks)
         return Document(
             title=title,
-            authors=list(source.authors),
-            affiliations=list(source.affiliations),
+            authors=linked.authors,
+            corresponding_author=linked.corresponding_author,
+            affiliations=linked.affiliations,
             abstract="\n".join(
                 self._sanitize_xml_text(block.text)
                 for block in blocks
@@ -956,7 +1276,9 @@ class MainWindow(QMainWindow):
         return
 
     def _make_block_item(self, block) -> object:
-        item = self._tree_item(block.id, f"{block.text[:60]}", block)
+        locked = self._article_locked(block)
+        prefix = "🔒 " if locked else ""
+        item = self._tree_item(block.id, f"{prefix}{block.text[:60]}", block)
         self._attach_merge_details(item, block)
         return item
 
@@ -1026,6 +1348,16 @@ class MainWindow(QMainWindow):
             return
         block = next((b for b in self.document.blocks if b.id == block_id), None)
         if block is None:
+            return
+        if self._article_locked(block):
+            self.tree.blockSignals(True)
+            item.setText(1, block.role)
+            self.tree.blockSignals(False)
+            QMessageBox.information(
+                self,
+                "Article finished",
+                "This block belongs to a finished article and is locked. Use Reopen Article to unlock it first.",
+            )
             return
         valid_roles = {"title", "author", "corresponding_author", "affiliation", "abstract"}
         new_role = item.text(1).strip().lower()
@@ -1119,6 +1451,10 @@ class MainWindow(QMainWindow):
         selected_blocks = [block for block in self.document.blocks if block.id in self._selected_block_ids]
         if len(selected_blocks) < 2:
             QMessageBox.information(self, "Select blocks", "Select at least two paragraph blocks to continue.")
+            return
+        locked_blocks = self._locked_selection_blocks(selected_blocks)
+        if locked_blocks:
+            self._warn_locked_blocks(locked_blocks)
             return
         valid, reason = self._selection_looks_like_paragraph_continuation(selected_blocks)
         if not valid:
@@ -1221,9 +1557,13 @@ class MainWindow(QMainWindow):
         by_id = {block.id: block for block in selected_blocks}
         changed: list[tuple[str, str]] = []
         zone_role_votes: dict[str, list[str]] = {}
+        skipped_locked = 0
         for block_id, role, confidence in assignments:
             block = by_id.get(block_id)
             if block is None or role not in {"title", "author", "affiliation", "abstract", "unclassified"}:
+                continue
+            if self._article_locked(block):
+                skipped_locked += 1
                 continue
             block.role = role
             block.confidence = confidence
@@ -1243,8 +1583,17 @@ class MainWindow(QMainWindow):
                         self._clear_manual_title_metadata_if_needed(other.id)
 
         if not changed:
+            if skipped_locked:
+                QMessageBox.information(
+                    self,
+                    "Article finished",
+                    f"{skipped_locked} selected block(s) belong to a finished article and were left locked.",
+                )
+                return
             QMessageBox.information(self, "No changes", "The selected blocks were not reclassified.")
             return
+        if skipped_locked:
+            self._log(f"Skipped {skipped_locked} locked block(s) during classification.")
 
         changed_ids = [block_id for block_id, _role in changed]
         for zone_id, roles in zone_role_votes.items():
@@ -1363,6 +1712,10 @@ class MainWindow(QMainWindow):
             return
         if len(selected_blocks) < 2:
             QMessageBox.information(self, "Select blocks", "Select at least two blocks to merge.")
+            return
+        locked_blocks = self._locked_selection_blocks(selected_blocks)
+        if locked_blocks:
+            self._warn_locked_blocks(locked_blocks)
             return
 
         if merge_source == "paragraph_continuation":
@@ -1832,7 +2185,7 @@ class MainWindow(QMainWindow):
         self.props.fields["Page"].setText(str(block.page))
         self.props.fields["Confidence"].setText(f"{block.confidence:.2f}")
         self.props.fields["Detected Role"].setText(block.role)
-        self.props.set_role(block.role)
+        self.props.set_role(block.role, locked=self._article_locked(block))
         self._update_merged_details(block)
 
     def _on_viewer_block_selected(self, block_id: str, additive: bool) -> None:
@@ -1993,6 +2346,8 @@ class MainWindow(QMainWindow):
         self._last_refine_report = refine_report
         self._review_block_ids = list(refine_report.review_ids)
         self._review_index = -1
+        self._finished_segment_keys = []
+        self._current_segment_key = None
         if refine_report.changed_count:
             self._log(
                 f"Auto-refined {refine_report.changed_count} block role(s); "
@@ -2017,6 +2372,7 @@ class MainWindow(QMainWindow):
         self._log(f"Pipeline report written to {report_path}")
         self.props.set_merge_details(None)
         self.props.set_role(None)
+        self._refresh_article_buttons()
 
     def _update_merged_details(self, block) -> None:
         """Show merge metadata for merged blocks and clear it otherwise."""
@@ -2128,8 +2484,9 @@ class MainWindow(QMainWindow):
 
         self.props.fields["Detected Role"].setText(zone.label)
         self.props.role_editor.setCurrentText(zone.label)
-        self.props.role_editor.setEnabled(True)
-        self.props.apply_role_btn.setEnabled(True)
+        zone_locked = any(self._article_locked(block) for block in self._blocks_for_zone(zone))
+        self.props.set_locked_state(zone_locked)
+        self.props.apply_role_btn.setEnabled(not zone_locked)
 
     def apply_selected_block_role(self) -> None:
         """Assign the chosen role to the current selected block."""
@@ -2146,6 +2503,11 @@ class MainWindow(QMainWindow):
             if zone is None:
                 return
             if zone.label == new_role and zone.source != "auto":
+                return
+            zone_blocks = self._blocks_for_zone(zone)
+            locked_zone_blocks = self._locked_selection_blocks(zone_blocks)
+            if locked_zone_blocks:
+                self._warn_locked_blocks(locked_zone_blocks)
                 return
             self._push_zone_update_undo(zone)
             zone.label = new_role
@@ -2178,6 +2540,13 @@ class MainWindow(QMainWindow):
         block_id = next(iter(self._selected_block_ids))
         block = next((b for b in self.document.blocks if b.id == block_id), None)
         if block is None:
+            return
+        if self._article_locked(block):
+            QMessageBox.information(
+                self,
+                "Article finished",
+                "This block belongs to a finished article and is locked. Use Reopen Article to unlock it first.",
+            )
             return
 
         if block.role == new_role:

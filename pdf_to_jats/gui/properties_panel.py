@@ -29,7 +29,7 @@ class PropertiesPanel(QWidget):
         form = QFormLayout(box)
         self.fields = {
             name: QLabel("-")
-            for name in ["Text", "Font", "Font Size", "Coordinates", "Page", "Confidence", "Detected Role"]
+            for name in ["Text", "Font", "Font Size", "Coordinates", "Page", "Confidence", "Detected Role", "Locked"]
         }
         for name, widget in self.fields.items():
             widget.setWordWrap(True)
@@ -68,18 +68,31 @@ class PropertiesPanel(QWidget):
         self.merge_box.setVisible(False)
         layout.addStretch(1)
 
-    def set_role(self, role: str | None) -> None:
+    def set_role(self, role: str | None, locked: bool = False) -> None:
         """Update the role editor to match the selected block."""
 
+        self._set_locked_state(locked)
         if not role:
             self.role_editor.setCurrentIndex(0)
-            self.role_editor.setEnabled(True)
+            self.role_editor.setEnabled(True and not locked)
             self.apply_role_btn.setEnabled(False)
             return
         index = self.role_editor.findText(role)
         self.role_editor.setCurrentIndex(index if index >= 0 else 0)
-        self.role_editor.setEnabled(True)
-        self.apply_role_btn.setEnabled(True)
+        self.role_editor.setEnabled(not locked)
+        self.apply_role_btn.setEnabled(not locked)
+
+    def set_locked_state(self, locked: bool) -> None:
+        """Reflect the lock state of the current selection."""
+
+        self._set_locked_state(locked)
+        self.apply_role_btn.setEnabled(not locked and self.apply_role_btn.isEnabled())
+
+    def _set_locked_state(self, locked: bool) -> None:
+        self.fields["Locked"].setText("🔒 yes" if locked else "no")
+        self.role_editor.setEnabled(not locked)
+        if locked:
+            self.apply_role_btn.setEnabled(False)
 
     def set_merge_details(self, details: dict[str, str] | None) -> None:
         """Populate the merged-details table."""

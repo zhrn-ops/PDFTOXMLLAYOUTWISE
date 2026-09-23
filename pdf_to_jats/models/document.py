@@ -13,6 +13,35 @@ from pdf_to_jats.models.block import TextBlock, reading_order_key
 from pdf_to_jats.models.paragraph import Paragraph
 
 
+REFINE_ROLES = frozenset({"title", "author", "corresponding_author", "affiliation", "abstract"})
+
+
+def block_matches_segment(block: TextBlock, segment: dict[str, Any] | None) -> bool:
+    """Return whether a block belongs to an article segment.
+
+    A page range alone cannot tell apart two articles that share a page, so
+    the block's recorded column is matched against the segment's columns when
+    both are known. Blocks without column information still match by page, and
+    a segment without columns matches every block in its page range.
+    """
+
+    if segment is None:
+        return False
+    start_page = int(segment.get("start_page", 1))
+    end_page = int(segment.get("end_page", start_page))
+    if not start_page <= int(block.page) <= end_page:
+        return False
+    columns = segment.get("columns")
+    block_column = block.metadata.get("column") if block.metadata else None
+    if columns is None:
+        return True
+    if block_column is None:
+        # Full-width lines (mastheads, abstract-number markers) span columns
+        # and are attributed to the segment whose range contains them.
+        return True
+    return int(block_column) in {int(column) for column in columns}
+
+
 @dataclass(slots=True)
 class DocumentZone:
     """User-editable region on a PDF page."""

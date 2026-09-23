@@ -468,6 +468,8 @@ class PDFViewer(QWidget):
         base_pen = QPen(QColor(220, 38, 38), 2)
         selected_pen = QPen(QColor(34, 197, 94), 3)
         multi_selected_pen = QPen(QColor(37, 99, 235), 3)
+        locked_pen = QPen(QColor(130, 130, 130), 2, Qt.DashLine)
+        locked_selected_pen = QPen(QColor(160, 160, 160), 3, Qt.DashLine)
         zone_pen = QPen(QColor(245, 158, 11), 2, Qt.DashLine)
         selected_zone_pen = QPen(QColor(234, 88, 12), 3)
         draft_pen = QPen(QColor(168, 85, 247), 2, Qt.DotLine)
@@ -481,7 +483,10 @@ class PDFViewer(QWidget):
             rect = fitz.Rect(bbox)
             scaled = fitz.Rect(rect.x0 * self._page_scale, rect.y0 * self._page_scale, rect.x1 * self._page_scale, rect.y1 * self._page_scale)
             block_id = str(block.get("id"))
-            if block_id == self._selected_block_id:
+            block_locked = bool((block.get("metadata") or {}).get("article_locked"))
+            if block_locked:
+                painter.setPen(locked_selected_pen if block_id in self._selected_block_ids or block_id == self._selected_block_id else locked_pen)
+            elif block_id == self._selected_block_id:
                 painter.setPen(selected_pen)
             elif block_id in self._selected_block_ids:
                 painter.setPen(multi_selected_pen)

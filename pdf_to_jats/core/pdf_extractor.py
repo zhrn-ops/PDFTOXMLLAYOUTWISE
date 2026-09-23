@@ -38,6 +38,9 @@ class PDFExtractor:
         self.visible_text_only = visible_text_only
         self.dark_threshold = dark_threshold
         self.use_docling = use_docling
+        # Marker blocks from the last extract() call, used to infer the column
+        # each article segment owns.
+        self._marker_blocks: list[TextBlock] = []
 
     def extract(self, pdf_path: str | Path) -> Document:
         path = Path(pdf_path)
@@ -304,16 +307,32 @@ class PDFExtractor:
                     markers.append({"abstract_number": value, "page": block.page, "block_id": block.id})
                     seen.add(key)
                 break
+        # _build_article_segments needs the marker blocks' column metadata.
+        self._marker_blocks = blocks
         return markers
 
     def _build_article_segments(
         self, markers: list[dict[str, Any]], page_count: int
     ) -> list[dict[str, Any]]:
-        """Create page ranges beginning at each distinct abstract marker."""
+        """Create page ranges beginning at each distinct abstract marker.
+
+        Conference journals lay out several abstracts side by side on one page,
+        so each segment also records the columns it spans. Column-less blocks
+        (full-width headers, abstract-number lines) match by page alone.
+        """
 
         segments: list[dict[str, Any]] = []
+        blocks_by_id = {block.id: block for block in self._marker_blocks}
+        marker_blocks_by_page: dict[int, list[TextBlock]] = {}
+        for block in self._marker_blocks:
+            marker_blocks_by_page.setdefault(int(block.page), []).append(block)
+
         for index, marker in enumerate(markers, start=1):
             next_page = markers[index]["page"] if index < len(markers) else page_count + 1
+            marker_block = blocks_by_id.get(marker["block_id"])
+            columns = self._segment_columns(
+                marker_block, marker_blocks_by_page.get(int(marker["page"]), [])
+            )
             segments.append(
                 {
                     "index": index,
@@ -321,9 +340,35 @@ class PDFExtractor:
                     "start_page": marker["page"],
                     "end_page": max(marker["page"], next_page - 1),
                     "abstract_number_block_id": marker["block_id"],
+                    "columns": columns,
                 }
             )
         return segments
+
+    def _segment_columns(
+        self, marker_block: TextBlock | None, page_marker_blocks: list[TextBlock]
+    ) -> list[int] | None:
+        """Infer which column one segment owns from its abstract-number marker.
+
+        A marker is a line at the very top of an article's column, so its own
+        column assignment is the strongest signal. When another marker on the
+        same page claims the same column, the column has no consistent owner
+        and matching falls back to the page range for every segment there.
+        """
+
+        if marker_block is None:
+            return None
+        own_column = marker_block.metadata.get("column")
+        if own_column is None:
+            return None
+        own_column = int(own_column)
+        for other in page_marker_blocks:
+            if other is marker_block:
+                continue
+            other_column = other.metadata.get("column")
+            if other_column is not None and int(other_column) == own_column:
+                return None
+        return [own_column]
 
     def _block_is_human_visible(self, bbox: fitz.Rect, pixmap: fitz.Pixmap, visible_area: fitz.Rect) -> bool:
         """Return whether a text line has rendered ink in its own bounding box."""
