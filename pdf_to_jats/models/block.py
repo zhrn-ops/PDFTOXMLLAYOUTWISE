@@ -28,3 +28,17 @@ class TextBlock:
     role: str = "unclassified"
     metadata: dict[str, Any] = field(default_factory=dict)
 
+
+def reading_order_key(block: TextBlock) -> tuple[int, float, float]:
+    """Sort key following column-aware reading order when it is known.
+
+    Extraction records a ``reading_order`` index that already accounts for
+    multi-column layouts. Falling back to raw coordinates would re-interleave
+    the columns, so only blocks without the index use position.
+    """
+
+    order = block.metadata.get("reading_order")
+    if order is None:
+        return (block.page, block.y, block.x)
+    return (block.page, float(order), block.x)
+

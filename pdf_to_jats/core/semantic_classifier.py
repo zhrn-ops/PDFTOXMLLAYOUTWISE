@@ -27,6 +27,13 @@ class ClassificationResult:
 class SemanticClassifier:
     """Assign semantic roles to PDF blocks."""
 
+    # Surname-first author lists carrying inline affiliation markers, e.g.
+    # "Nahas, S.J.1; Zhao, Y.2; Graham, C.3". The initials-first patterns
+    # below cannot see these, so they used to score as titles.
+    _SURNAME_FIRST_AUTHORS = re.compile(
+        r"^(?:[A-Z][A-Za-z'\u2019\-]+,\s*(?:[A-Z]\.){1,3}\d*(?:\s*[,;]\s*)?){2,}"
+    )
+
     def __init__(self) -> None:
         self.layout_analyzer = LayoutAnalyzer()
 
@@ -79,6 +86,8 @@ class SemanticClassifier:
             scores["author"] += 35
         if re.search(r"(?:[A-Z]\.\s*[A-Z]?[a-zA-Z'’\-]+(?:\s+[A-Z]\.)?\s*;\s*)+[A-Z]\.\s*[A-Z]?[a-zA-Z'’\-]+", text):
             scores["author"] += 35
+        if self._SURNAME_FIRST_AUTHORS.match(text):
+            scores["author"] += 40
         if re.search(r"^\s*[A-Z]\.\s*[A-Z][a-zA-Z'’\-]+(?:\s+\d+)?\s*$", text):
             scores["author"] += 28
         if re.search(r"^\s*[A-Z]\.\s*[A-Z][a-zA-Z'’\-]+(?:\s+\d+)?(?:\s*[;,.]\s*)?$", text):

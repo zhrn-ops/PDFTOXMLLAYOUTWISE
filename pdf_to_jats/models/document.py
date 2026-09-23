@@ -9,7 +9,7 @@ import json
 
 from pdf_to_jats.models.affiliation import Affiliation
 from pdf_to_jats.models.author import Author
-from pdf_to_jats.models.block import TextBlock
+from pdf_to_jats.models.block import TextBlock, reading_order_key
 from pdf_to_jats.models.paragraph import Paragraph
 
 
@@ -67,7 +67,7 @@ class Document:
         excluded_ids = set(self.metadata.get("abstract_number_block_ids", []))
         lines: list[str] = []
         current_page: int | None = None
-        for block in sorted(self.blocks, key=lambda item: (item.page, item.y, item.x)):
+        for block in sorted(self.blocks, key=reading_order_key):
             if block.id in excluded_ids:
                 continue
             if block.page != current_page:

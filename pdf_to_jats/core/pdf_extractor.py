@@ -11,7 +11,7 @@ from typing import Any
 
 import fitz
 
-from pdf_to_jats.models.block import TextBlock
+from pdf_to_jats.models.block import TextBlock, reading_order_key
 from pdf_to_jats.models.document import Document
 
 LOGGER = logging.getLogger(__name__)
@@ -19,6 +19,15 @@ LOGGER = logging.getLogger(__name__)
 
 class PDFExtractor:
     """Extract text, images, and layout information from a PDF."""
+
+    # A vertical whitespace gutter this wide (in points, and as a fraction of
+    # the page width) separates the columns of a multi-column page.
+    COLUMN_GUTTER_MIN_POINTS = 8.0
+    COLUMN_GUTTER_MIN_RATIO = 0.02
+    # Guards against splitting a single-column page on one stray gap.
+    COLUMN_MIN_BLOCKS = 4
+    COLUMN_MIN_BLOCK_RATIO = 0.10
+    COLUMN_MIN_Y_OVERLAP = 0.30
 
     def __init__(
         self,
@@ -44,6 +53,7 @@ class PDFExtractor:
                 visible_area = self._visible_page_rect(page)
                 text_dict = page.get_text("dict", clip=visible_area)
                 page_pixmap = self._render_visible_page(page, visible_area) if self.visible_text_only else None
+                page_blocks: list[TextBlock] = []
                 for block in text_dict.get("blocks", []):
                     if block.get("type") != 0:
                         continue
@@ -71,7 +81,9 @@ class PDFExtractor:
                         flags = int(spans[0].get("flags", 0)) if spans else 0
                         color = str(spans[0].get("color", "")) if spans else ""
 
-                        block_id = f"block_{page_index:03d}_{len(document.blocks) + 1:03d}"
+                        # The final id is assigned once the page is put into
+                        # reading order, so this is only a placeholder.
+                        block_id = f"pending_{page_index:03d}_{len(page_blocks) + 1:03d}"
                         extracted = TextBlock(
                             id=block_id,
                             page=page_index,
@@ -97,7 +109,15 @@ class PDFExtractor:
                             },
                         )
                         self._attach_docling_evidence(extracted, docling_items)
-                        document.blocks.append(extracted)
+                        page_blocks.append(extracted)
+
+                # PyMuPDF returns lines in content-stream order, which
+                # interleaves the columns of a two-column journal page. Restore
+                # reading order before the rest of the pipeline sees them.
+                for extracted in self._order_page_blocks(page_blocks, visible_area):
+                    extracted.id = f"block_{page_index:03d}_{len(document.blocks) + 1:03d}"
+                    extracted.metadata["reading_order"] = len(document.blocks)
+                    document.blocks.append(extracted)
 
                 for image_index, image in enumerate(page.get_images(full=True), start=1):
                     document.figures.append(
@@ -238,7 +258,7 @@ class PDFExtractor:
     def _extract_abstract_number(self, blocks: list[TextBlock]) -> tuple[str, list[str]]:
         """Find a conference abstract number from the earliest content blocks."""
 
-        page_one_blocks = [block for block in sorted(blocks, key=lambda item: (item.page, item.y, item.x)) if block.page == 1]
+        page_one_blocks = [block for block in sorted(blocks, key=reading_order_key) if block.page == 1]
         page_one_text = " ".join(" ".join(block.text.replace("\n", " ").split()) for block in page_one_blocks)
         if not page_one_text:
             return "", []
@@ -272,7 +292,7 @@ class PDFExtractor:
             r"^\s*(?=[A-Z0-9./-]{1,30}\d)([A-Z0-9][A-Z0-9./-]{1,30})\s*(?:\||\u2502)\s*",
             r"\b(?:abstract\s*(?:no\.?|number|nr\.?|id)?|absn)\s*[:#-]?\s*([A-Z0-9][A-Z0-9./-]{1,30})\b",
         )
-        for block in sorted(blocks, key=lambda item: (item.page, item.y, item.x)):
+        for block in sorted(blocks, key=reading_order_key):
             cleaned = " ".join(block.text.replace("\n", " ").split())
             for pattern in patterns:
                 match = re.search(pattern, cleaned, flags=re.IGNORECASE)
@@ -343,6 +363,100 @@ class PDFExtractor:
         # a minimum number of dark pixels as well as a low density threshold.
         dark_ratio = dark_count / total_count
         return dark_count >= 4 and dark_ratio >= 0.003
+
+    def _order_page_blocks(
+        self, blocks: list[TextBlock], visible_area: fitz.Rect
+    ) -> list[TextBlock]:
+        """Return one page's lines in reading order.
+
+        Journal pages place several articles side by side. PyMuPDF emits their
+        lines interleaved by vertical position, which merges unrelated articles
+        into one abstract and splits author/affiliation lines across columns.
+        Detecting the gutter lets one column be read top-to-bottom before the
+        next one starts.
+        """
+
+        if len(blocks) < 2:
+            return list(blocks)
+        gutter = self._find_column_gutter(blocks, visible_area)
+        if gutter is None:
+            return sorted(blocks, key=lambda block: (block.y, block.x))
+
+        left: list[TextBlock] = []
+        right: list[TextBlock] = []
+        spanning: list[TextBlock] = []
+        for block in blocks:
+            if block.bbox[2] <= gutter[0] + 0.5:
+                block.metadata["column"] = 0
+                left.append(block)
+            elif block.bbox[0] >= gutter[1] - 0.5:
+                block.metadata["column"] = 1
+                right.append(block)
+            else:
+                # Full-width lines keep no column: they span every column.
+                spanning.append(block)
+
+        minimum = max(self.COLUMN_MIN_BLOCKS, int(len(blocks) * self.COLUMN_MIN_BLOCK_RATIO))
+        if len(left) < minimum or len(right) < minimum:
+            return sorted(blocks, key=lambda block: (block.y, block.x))
+
+        left.sort(key=lambda block: (block.y, block.x))
+        right.sort(key=lambda block: (block.y, block.x))
+        spanning.sort(key=lambda block: (block.y, block.x))
+
+        # Full-width lines above the columns (mastheads, section headings) belong
+        # before them; anything lower spans both columns and is kept last.
+        first_column_y = min(left[0].y, right[0].y)
+        leading = [block for block in spanning if block.y < first_column_y]
+        trailing = [block for block in spanning if block.y >= first_column_y]
+        return [*leading, *left, *right, *trailing]
+
+    def _find_column_gutter(
+        self, blocks: list[TextBlock], visible_area: fitz.Rect
+    ) -> tuple[float, float] | None:
+        """Locate the vertical whitespace gap between two text columns."""
+
+        page_width = visible_area.width
+        if page_width <= 0:
+            return None
+        intervals = sorted(
+            (block.bbox[0], block.bbox[2])
+            for block in blocks
+            if block.bbox[2] > block.bbox[0]
+        )
+        if len(intervals) < 2:
+            return None
+
+        best: tuple[float, float] | None = None
+        cursor = visible_area.x0
+        for start, end in intervals:
+            if start - cursor > 0:
+                middle = (cursor + start) / 2.0
+                ratio = (middle - visible_area.x0) / page_width
+                if 0.25 <= ratio <= 0.75:
+                    if best is None or (start - cursor) > (best[1] - best[0]):
+                        best = (cursor, start)
+            cursor = max(cursor, end)
+
+        if best is None:
+            return None
+        gap = best[1] - best[0]
+        if gap < max(self.COLUMN_GUTTER_MIN_POINTS, page_width * self.COLUMN_GUTTER_MIN_RATIO):
+            return None
+
+        # Real columns run alongside each other, so require overlapping vertical
+        # extents; otherwise this is just a ragged right margin.
+        left = [block for block in blocks if block.bbox[2] <= best[0] + 0.5]
+        right = [block for block in blocks if block.bbox[0] >= best[1] - 0.5]
+        if not left or not right:
+            return None
+        left_span = (min(b.y for b in left), max(b.y + b.height for b in left))
+        right_span = (min(b.y for b in right), max(b.y + b.height for b in right))
+        overlap = min(left_span[1], right_span[1]) - max(left_span[0], right_span[0])
+        shorter = min(left_span[1] - left_span[0], right_span[1] - right_span[0])
+        if shorter <= 0 or overlap / shorter < self.COLUMN_MIN_Y_OVERLAP:
+            return None
+        return best
 
     def _infer_line_alignment(self, line: dict[str, Any], visible_area: fitz.Rect) -> str:
         bbox = line.get("bbox")

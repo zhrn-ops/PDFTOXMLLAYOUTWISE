@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 )
 
 from pdf_to_jats.core.author_linker import AuthorLinker
+from pdf_to_jats.core.auto_refiner import AutoRefiner, is_abstract_heading
 from pdf_to_jats.core.jats_generator import JATSGenerator
 from pdf_to_jats.core.pdf_extractor import PDFExtractor
 from pdf_to_jats.core.paragraph_reconstructor import ParagraphReconstructor
@@ -45,6 +46,7 @@ from pdf_to_jats.gui.pdf_viewer import PDFViewer
 from pdf_to_jats.gui.properties_panel import PropertiesPanel
 from pdf_to_jats.gui.structure_tree import StructureTree
 from pdf_to_jats.gui.styles import APP_STYLE
+from pdf_to_jats.models.block import reading_order_key
 from pdf_to_jats.models.document import Document, DocumentZone
 from pdf_to_jats.models.paragraph import Paragraph
 from pdf_to_jats.utils.config import load_config, save_openrouter_settings
@@ -64,6 +66,7 @@ class MainWindow(QMainWindow):
             use_docling=False,
         )
         self.classifier = SemanticClassifier()
+        self.auto_refiner = AutoRefiner()
         self.paragraph_reconstructor = ParagraphReconstructor()
         self.openrouter_client = self._create_llm_client()
         self.linker = AuthorLinker()
@@ -79,6 +82,9 @@ class MainWindow(QMainWindow):
         self._selected_zone_ids: set[str] = set()
         self._undo_stack: list[dict[str, object]] = []
         self._active_zone_move_undo_id: str | None = None
+        self._last_refine_report = None
+        self._review_block_ids: list[str] = []
+        self._review_index = -1
         self.setWindowTitle(self.config.app_name)
         self.setMinimumSize(720, 520)
         self.setStyleSheet(APP_STYLE)
@@ -197,6 +203,17 @@ class MainWindow(QMainWindow):
         self.clear_selection_btn = QPushButton("Clear Selection")
         self.clear_selection_btn.clicked.connect(self.clear_selection)
         self.props.apply_role_btn.clicked.connect(self.apply_selected_block_role)
+        auto_pipeline_btn = QPushButton("Auto Pipeline")
+        auto_pipeline_btn.setToolTip(
+            "Extract, classify, auto-refine, and export XML to the default folder in one click."
+        )
+        auto_pipeline_btn.clicked.connect(self.run_auto_pipeline)
+        review_btn = QPushButton("Next Review Item")
+        review_btn.setToolTip("Jump to the next block the auto-refiner flagged for review.")
+        review_btn.clicked.connect(self.goto_next_review_item)
+        self.actions_layout = actions
+        actions.addWidget(auto_pipeline_btn, 1, 0)
+        actions.addWidget(review_btn, 1, 1)
         self.tree.itemSelectionChanged.connect(self._on_tree_selection_changed)
         self.tree.itemChanged.connect(self._on_tree_item_changed)
         self.viewer.label.blockSelected.connect(self._on_viewer_block_selected)
@@ -411,6 +428,80 @@ class MainWindow(QMainWindow):
         path = QFileDialog.getExistingDirectory(self, title, str(initial_dir.resolve()))
         return Path(path) if path else None
 
+    def goto_next_review_item(self) -> None:
+        """Cycle selection through blocks the auto-refiner flagged for review."""
+
+        if self.document is None or not self._review_block_ids:
+            QMessageBox.information(
+                self, "Nothing to review", "No blocks are flagged for review."
+            )
+            return
+        by_id = {block.id: block for block in self.document.blocks}
+        # Skip blocks whose roles were fixed by hand since the review list built.
+        while self._review_index + 1 < len(self._review_block_ids):
+            self._review_index += 1
+            candidate = by_id.get(self._review_block_ids[self._review_index])
+            if candidate is not None:
+                break
+        else:
+            self._review_index = -1
+            QMessageBox.information(self, "Review complete", "All review items processed.")
+            return
+        block_id = candidate.id
+        block = by_id.get(block_id)
+        if block is None:
+            return
+        self._selected_zone_id = None
+        self._selected_zone_ids.clear()
+        self.viewer.set_selected_zones(set())
+        self._selected_block_ids = {block_id}
+        self.viewer.set_selected_blocks(self._selected_block_ids, block_id)
+        self._select_block_by_id(block_id, preserve_selection=False)
+        self._sync_tree_selection()
+        self._update_selection_status()
+        self._update_selection_panel()
+        self._update_html_preview()
+        self._log(
+            f"Review {self._review_index + 1}/{len(self._review_block_ids)}: {block_id} ({block.role})"
+        )
+
+    def run_auto_pipeline(self) -> None:
+        """One-click pipeline: current PDF through refine + export with no dialogs."""
+
+        if self.document is None:
+            QMessageBox.information(self, "No document", "Load a PDF first.")
+            return
+        self._update_document_model()
+        export_document = self._document_with_html_preview_continuations()
+        validation_errors = self.validator.validate_document(export_document)
+        for error in validation_errors:
+            self._log(f"Document validation error: {error.message}")
+        segments = export_document.metadata.get("article_segments", [])
+        if segments:
+            documents = [self._document_for_segment(segment, export_document) for segment in segments]
+        else:
+            documents = [export_document]
+        output_dir = self.config.generated_xml_dir
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_paths: list[Path] = []
+        for index, segment_document in enumerate(documents, start=1):
+            filename = "article.xml" if len(documents) == 1 else f"article_{index:03d}.xml"
+            output_path = output_dir / filename
+            generated_path = self.generator.generate(segment_document, output_path)
+            output_paths.append(generated_path)
+            errors = self.validator.validate(generated_path)
+            if errors:
+                for error in errors:
+                    self._log(f"Validation error in {generated_path.name}: {error.message}")
+            else:
+                self._log(f"XML written to {generated_path}")
+        self.current_xml_path = output_paths[0] if output_paths else None
+        review_count = len(self._review_block_ids)
+        if review_count:
+            self._log(f"Auto pipeline complete: {review_count} block(s) flagged for review.")
+        else:
+            self._log("Auto pipeline complete.")
+
     def _has_html_preview_continuation(self, block_ids: set[str]) -> bool:
         return any(set(group) == block_ids for group in self._html_preview_merges)
 
@@ -506,7 +597,7 @@ class MainWindow(QMainWindow):
             abstract="\n".join(
                 self._sanitize_xml_text(block.text)
                 for block in visible_blocks
-                if block.role == "abstract" and block.text.strip()
+                if block.role == "abstract" and block.text.strip() and not is_abstract_heading(block.text)
             ),
             raw_blocks=[replace(block, metadata=dict(block.metadata)) for block in source.raw_blocks],
             blocks=blocks,
@@ -622,13 +713,17 @@ class MainWindow(QMainWindow):
         ]
         self.document.title = self._compose_title(blocks)
         abstract_blocks = [b for b in blocks if b.role == "abstract"]
-        abstract_blocks.sort(key=lambda b: (b.page, b.y, b.x))
-        abstract_text = "\n".join(self._sanitize_xml_text(b.text) for b in abstract_blocks)
+        abstract_blocks.sort(key=reading_order_key)
+        abstract_text = "\n".join(
+            self._sanitize_xml_text(b.text)
+            for b in abstract_blocks
+            if not is_abstract_heading(b.text)
+        )
         self.document.abstract = abstract_text
         author_blocks = [b for b in blocks if b.role in {"author", "corresponding_author"}]
-        author_blocks.sort(key=lambda b: (b.page, b.y, b.x))
+        author_blocks.sort(key=reading_order_key)
         affiliation_blocks = [b for b in blocks if b.role == "affiliation"]
-        affiliation_blocks.sort(key=lambda b: (b.page, b.y, b.x))
+        affiliation_blocks.sort(key=reading_order_key)
         linked = self.linker.link_from_blocks(author_blocks, affiliation_blocks)
         self.document.authors = linked.authors
         self.document.corresponding_author = linked.corresponding_author
@@ -692,7 +787,7 @@ class MainWindow(QMainWindow):
             abstract="\n".join(
                 self._sanitize_xml_text(block.text)
                 for block in blocks
-                if block.role == "abstract" and block.text.strip()
+                if block.role == "abstract" and block.text.strip() and not is_abstract_heading(block.text)
             ),
             raw_blocks=raw_blocks,
             blocks=blocks,
@@ -723,14 +818,53 @@ class MainWindow(QMainWindow):
         return any(term in lower for term in footer_terms)
 
     def _rebuild_paragraph_model(self) -> None:
-        """Refresh proposed paragraphs and preserve accepted manual paragraph units."""
+        """Refresh proposed paragraphs; auto-accept clean single-block units."""
 
         if self.document is None:
             return
         source_lines = self.document.raw_blocks or self.document.blocks
         proposals = self.paragraph_reconstructor.propose(source_lines)
         accepted = self.paragraph_reconstructor.accepted_from_blocks(self.document.blocks)
+        # Manual merge units win; skip auto-accepting proposals that overlap them.
+        manual_line_ids = {
+            line_id
+            for paragraph in accepted
+            for line_id in paragraph.source_line_ids
+        }
+        for proposal in proposals:
+            proposal_line_ids = set(proposal.source_line_ids)
+            if proposal_line_ids & manual_line_ids:
+                continue
+            if self._is_clean_paragraph_proposal(proposal, source_lines):
+                proposal.status = "accepted"
+                proposal.role = self._proposal_role(proposal)
         self.document.paragraphs = proposals + accepted
+
+    def _is_clean_paragraph_proposal(self, proposal, source_lines) -> bool:
+        """A proposal is auto-acceptable when typography and column are uniform."""
+
+        wanted = set(proposal.source_line_ids)
+        lines = [block for block in source_lines if block.id in wanted]
+        if len(lines) < 2:
+            return True
+        if len({round(block.font_size, 1) for block in lines}) > 1:
+            return False
+        if len({block.bold for block in lines}) > 1:
+            return False
+        return True
+
+    def _proposal_role(self, proposal) -> str:
+        """Inherit the most common non-unclassified role among source lines."""
+
+        roles: list[str] = []
+        by_id = {block.id: block for block in (self.document.raw_blocks or self.document.blocks)}
+        for line_id in proposal.source_line_ids:
+            block = by_id.get(line_id)
+            if block is not None and block.role not in {"unclassified", ""}:
+                roles.append(block.role)
+        if not roles:
+            return "body"
+        return max(set(roles), key=roles.count)
 
     def _compose_title(self, blocks) -> str:
         """Build the title from blocks the user marked as title."""
@@ -738,7 +872,7 @@ class MainWindow(QMainWindow):
         title_blocks = [block for block in blocks if block.role == "title"]
         if not title_blocks:
             return ""
-        title_blocks.sort(key=lambda b: (b.page, b.y, b.x))
+        title_blocks.sort(key=reading_order_key)
         page1_blocks = [block for block in title_blocks if block.page == 1]
         candidates = page1_blocks if page1_blocks else title_blocks
         top = candidates[0]
@@ -1024,7 +1158,7 @@ class MainWindow(QMainWindow):
             for block in selected_zone_blocks:
                 selected_blocks_by_id.setdefault(block.id, block)
             selected_blocks = list(selected_blocks_by_id.values())
-            selected_blocks.sort(key=lambda block: (block.page, block.y, block.x))
+            selected_blocks.sort(key=reading_order_key)
         if not selected_blocks:
             QMessageBox.information(self, "Select blocks", "Select one or more text blocks or a zone first.")
             return
@@ -1234,7 +1368,7 @@ class MainWindow(QMainWindow):
         if merge_source == "paragraph_continuation":
             selected_blocks = self._sort_paragraph_continuation_blocks(selected_blocks)
         else:
-            selected_blocks = sorted(selected_blocks, key=lambda block: (block.page, block.y, block.x))
+            selected_blocks = sorted(selected_blocks, key=reading_order_key)
         selected_ids = {block.id for block in selected_blocks}
         merged_block = self._merge_blocks(selected_blocks, merge_source=merge_source, join_with_space=join_with_space)
         remaining_blocks = [block for block in self.document.blocks if block.id not in selected_ids]
@@ -1429,7 +1563,7 @@ class MainWindow(QMainWindow):
         merged_block = replace(self._last_manual_merge["merged_block"])
         self.document.blocks = [block for block in self.document.blocks if block.id != merged_id]
         self.document.blocks.extend(original_blocks)
-        self.document.blocks.sort(key=lambda block: (block.page, block.y, block.x))
+        self.document.blocks.sort(key=reading_order_key)
         self._selected_block_ids = {block.id for block in original_blocks}
         self._redo_manual_merge = {
             "merged_id": merged_id,
@@ -1569,7 +1703,7 @@ class MainWindow(QMainWindow):
             return
 
         selected_zones.sort(key=lambda zone: (zone.page, zone.bbox[1], zone.bbox[0]))
-        selected_blocks.sort(key=lambda block: (block.page, block.y, block.x))
+        selected_blocks.sort(key=reading_order_key)
         all_bboxes = []
         for zone in selected_zones:
             zone_bboxes = getattr(zone, "bboxes", []) or [zone.bbox]
@@ -1625,7 +1759,7 @@ class MainWindow(QMainWindow):
         removed_ids = {block.id for block in original_blocks}
         self.document.blocks = [block for block in self.document.blocks if block.id not in removed_ids]
         self.document.blocks.append(merged_block)
-        self.document.blocks.sort(key=lambda block: (block.page, block.y, block.x))
+        self.document.blocks.sort(key=reading_order_key)
         self._selected_block_ids = {merged_block.id}
         self._last_manual_merge = {
             "merged_id": merged_block.id,
@@ -1736,7 +1870,7 @@ class MainWindow(QMainWindow):
         if not getattr(self, "_range_anchor_block_id", None):
             self._on_viewer_block_selected(block_id, False)
             return
-        ordered = sorted(self.document.blocks, key=lambda block: (block.page, block.y, block.x))
+        ordered = sorted(self.document.blocks, key=reading_order_key)
         ids = [block.id for block in ordered]
         try:
             start = ids.index(self._range_anchor_block_id)
@@ -1813,7 +1947,7 @@ class MainWindow(QMainWindow):
             return
         selected_blocks = [block for block in self.document.blocks if block.id in self._selected_block_ids]
         selected_zones = [zone for zone in self.document.zones if zone.id in self._selected_zone_ids]
-        selected_blocks.sort(key=lambda block: (block.page, block.y, block.x))
+        selected_blocks.sort(key=reading_order_key)
         selected_zones.sort(key=lambda zone: (zone.page, zone.bbox[1], zone.bbox[0]))
         self.selection_list.clear()
         if not selected_blocks and not selected_zones:
@@ -1853,6 +1987,17 @@ class MainWindow(QMainWindow):
         for block, result in zip(self.document.blocks, results, strict=False):
             block.role = result.role
             block.confidence = result.confidence
+            block.metadata["role_source"] = "heuristic"
+        # Deterministic cleanup of predictable heuristic mistakes.
+        refine_report = self.auto_refiner.refine(self.document.blocks)
+        self._last_refine_report = refine_report
+        self._review_block_ids = list(refine_report.review_ids)
+        self._review_index = -1
+        if refine_report.changed_count:
+            self._log(
+                f"Auto-refined {refine_report.changed_count} block role(s); "
+                f"{refine_report.review_count} need review."
+            )
         self._update_document_model()
         self.viewer.load_pdf(path)
         self.viewer.set_blocks([asdict(block) for block in self.document.blocks])
