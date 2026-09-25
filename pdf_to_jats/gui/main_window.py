@@ -12,6 +12,8 @@ from PySide6.QtCore import QUrl, Qt
 from PySide6.QtGui import QColor, QKeySequence, QPalette, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -21,6 +23,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QMenu,
     QListWidget,
     QListWidgetItem,
     QPushButton,
@@ -29,6 +32,7 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QTextBrowser,
     QToolButton,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -43,7 +47,11 @@ from pdf_to_jats.core.validator import Validator
 from pdf_to_jats.llm.openrouter_client import OpenRouterClient, OpenRouterRateLimitError
 from pdf_to_jats.llm.prompts import QUESTION_ANSWER_PROMPT, ROLE_ASSIGNMENT_PROMPT
 from pdf_to_jats.gui.pdf_viewer import PDFViewer
-from pdf_to_jats.gui.properties_panel import PropertiesPanel
+from pdf_to_jats.gui.properties_panel import (
+    AuthorAffiliationReviewPanel,
+    MetadataPanel,
+    PropertiesPanel,
+)
 from pdf_to_jats.gui.structure_tree import StructureTree
 from pdf_to_jats.gui.styles import APP_STYLE
 from pdf_to_jats.models.block import reading_order_key
@@ -226,10 +234,11 @@ class MainWindow(QMainWindow):
         self.html_preview.setPlaceholderText("HTML reading-order preview will appear after loading a PDF.")
         self.tree = StructureTree()
         self.props = PropertiesPanel()
+        self.metadata_panel = MetadataPanel()
+        self.author_affiliation_review_panel = AuthorAffiliationReviewPanel()
         self.viewer.setMinimumSize(0, 0)
         self.tree.setMinimumSize(0, 0)
         self.props.setMinimumSize(0, 0)
-        self._refresh_article_buttons()
         self.tree_hint = QLabel("Selected blocks: 0")
         self.tree_hint.setWordWrap(True)
         self.selection_hint = QLabel("Merge selection is empty.")
@@ -240,6 +249,7 @@ class MainWindow(QMainWindow):
         self.clear_selection_btn = QPushButton("Clear Selection")
         self.clear_selection_btn.clicked.connect(self.clear_selection)
         self.props.apply_role_btn.clicked.connect(self.apply_selected_block_role)
+        self.metadata_panel.apply_abstract_number_btn.clicked.connect(self.apply_abstract_number)
         self.actions_layout = actions
         self.tree.itemSelectionChanged.connect(self._on_tree_selection_changed)
         self.tree.itemChanged.connect(self._on_tree_item_changed)
@@ -258,26 +268,65 @@ class MainWindow(QMainWindow):
         viewer_layout = QVBoxLayout(viewer_column)
         viewer_layout.setContentsMargins(0, 0, 0, 0)
         viewer_layout.addWidget(self.viewer)
-        tree_column = QWidget()
-        tree_layout = QVBoxLayout(tree_column)
-        tree_layout.setContentsMargins(0, 0, 0, 0)
-        tree_layout.addWidget(self.tree_hint)
-        tree_layout.addWidget(self.tree, 1)
-        tree_layout.addWidget(self.selection_hint)
-        tree_layout.addWidget(self.selection_list)
-        tree_layout.addWidget(self.clear_selection_btn)
+        self.articles_box = QGroupBox("Detected Articles")
+        articles_layout = QVBoxLayout(self.articles_box)
+        self.articles_hint = QLabel("Load a PDF to see detected articles.")
+        self.articles_hint.setWordWrap(True)
+        # One tab per detected article keeps the box clean; the merge flow for
+        # false splits moves into a dialog from the current article's tab.
+        self.articles_tabs = QTabWidget()
+        self.articles_tabs.setDocumentMode(True)
+        self.articles_tabs.tabBar().setExpanding(True)
+        self.articles_tabs.setUsesScrollButtons(True)
+        self.articles_tabs.tabBarClicked.connect(self._on_article_tab_clicked)
+        self.articles_tabs.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.articles_tabs.customContextMenuRequested.connect(self._show_article_tab_menu)
+        self.merge_segments_btn = QPushButton("Merge Current With...")
+        self.merge_segments_btn.setToolTip(
+            "Combine the current article with another one that was split by mistake."
+        )
+        self.merge_segments_btn.setEnabled(False)
+        self.merge_segments_btn.clicked.connect(self.merge_selected_segments)
+        articles_layout.addWidget(self.articles_hint)
+        articles_layout.addWidget(self.articles_tabs, 1)
+        articles_layout.addWidget(self.merge_segments_btn)
+
+        selected_column = QWidget()
+        selected_layout = QVBoxLayout(selected_column)
+        selected_layout.setContentsMargins(0, 0, 0, 0)
+        selected_layout.addWidget(self.tree_hint)
+        selected_layout.addWidget(self.tree, 1)
+        selected_layout.addWidget(self.selection_hint)
+        selected_layout.addWidget(self.selection_list)
+        selected_layout.addWidget(self.clear_selection_btn)
+
+        preview_page = QWidget()
+        preview_layout = QVBoxLayout(preview_page)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.addWidget(self.html_preview)
+
+        # The right side stacks all work areas as tabs so each gets the full
+        # pane height instead of competing in one narrow column.
+        self.work_tabs = QTabWidget()
+        self.work_tabs.setDocumentMode(True)
+        self.work_tabs.addTab(self.articles_box, "Detected Articles")
+        self.work_tabs.addTab(selected_column, "Selected Blocks")
+        self.work_tabs.addTab(self.props, "Properties")
+        self.work_tabs.addTab(self.metadata_panel, "Article Metadata")
+        self.work_tabs.addTab(
+            self.author_affiliation_review_panel, "Author & Affiliation Review"
+        )
+        self.work_tabs.addTab(preview_page, "Preview")
+
         self.body_splitter = QSplitter(Qt.Horizontal)
         self.body_splitter.addWidget(viewer_column)
-        self.body_splitter.addWidget(tree_column)
-        self.body_splitter.addWidget(self.props)
-        self.body_splitter.addWidget(self.html_preview)
+        self.body_splitter.addWidget(self.work_tabs)
         self.body_splitter.setStretchFactor(0, 3)
         self.body_splitter.setStretchFactor(1, 2)
-        self.body_splitter.setStretchFactor(2, 1)
-        self.body_splitter.setStretchFactor(3, 2)
         self.body_splitter.setChildrenCollapsible(False)
         root.addWidget(self.body_splitter, 1)
 
+        self._refresh_article_buttons()
         self.setAcceptDrops(True)
 
         self.log = QTextEdit()
@@ -286,6 +335,20 @@ class MainWindow(QMainWindow):
         self.log.setMaximumHeight(140)
         root.addWidget(QLabel("Processing Log"))
         root.addWidget(self.log)
+
+    # Tab indices of the right-side work-area tabs.
+    TAB_ARTICLES = 0
+    TAB_SELECTED = 1
+    TAB_PROPERTIES = 2
+    TAB_METADATA = 3
+    TAB_AUTHOR_AFFILIATIONS = 4
+    TAB_PREVIEW = 5
+
+    def _show_work_tab(self, index: int) -> None:
+        """Bring one of the right-side work-area tabs to the front."""
+
+        if hasattr(self, "work_tabs"):
+            self.work_tabs.setCurrentIndex(index)
 
     def _configured_openrouter_fallback_models(self) -> tuple[str, ...]:
         return tuple(
@@ -305,14 +368,14 @@ class MainWindow(QMainWindow):
         """Stack the work areas when the window is too narrow for three panes."""
 
         if hasattr(self, "body_splitter"):
-            narrow = self.width() < 1050
+            narrow = self.width() < 900
             orientation = Qt.Vertical if narrow else Qt.Horizontal
             if self.body_splitter.orientation() != orientation:
                 self.body_splitter.setOrientation(orientation)
                 if narrow:
-                    self.body_splitter.setSizes([420, 260, 220])
+                    self.body_splitter.setSizes([360, 420])
                 else:
-                    self.body_splitter.setSizes([600, 400, 280])
+                    self.body_splitter.setSizes([620, 640])
         super().resizeEvent(event)
 
     def _set_openrouter_settings_visible(self, visible: bool) -> None:
@@ -514,6 +577,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No document", "Load a PDF first.")
             return
         self._update_document_model()
+        self._log_link_issues()
         export_document = self._document_with_html_preview_continuations()
         validation_errors = self.validator.validate_document(export_document)
         for error in validation_errors:
@@ -998,17 +1062,282 @@ class MainWindow(QMainWindow):
             self.finish_article_btn.setEnabled(False)
             self.finish_article_btn.setText("Finish Article")
             self.reopen_article_btn.setEnabled(False)
+            self.metadata_panel.set_abstract_number("", enabled=False)
+            self.author_affiliation_review_panel.set_link_review([], [], [], enabled=False)
+            self._refresh_articles_list()
             return
+        # The abstract number is article-level, so the inspector mirrors the
+        # current article rather than the selected block.
         current = self._current_segment()
         if current is None:
             self.finish_article_btn.setEnabled(False)
             self.finish_article_btn.setText("Finish Article")
+            self.metadata_panel.set_abstract_number(self.document.abstract_number())
         else:
             segment, _key = current
             self.finish_article_btn.setEnabled(True)
             abstract_number = str(segment.get("abstract_number", "")).strip()
             self.finish_article_btn.setText(f"Finish {abstract_number}" if abstract_number else "Finish Article")
+            self.metadata_panel.set_abstract_number(abstract_number)
         self.reopen_article_btn.setEnabled(bool(self._finished_segment_keys))
+        self._refresh_link_review()
+        self._refresh_articles_list()
+
+    def _refresh_link_review(self) -> None:
+        """Mirror the author/affiliation links and flagged issues in the inspector."""
+
+        if self.document is None:
+            self.author_affiliation_review_panel.set_link_review([], [], [], enabled=False)
+            return
+        self.author_affiliation_review_panel.set_link_review(
+            self.document.authors,
+            self.document.affiliations,
+            self.document.metadata.get("link_issues", []),
+        )
+
+    def _refresh_articles_list(self) -> None:
+        """Show one tab per detected article so false splits can be merged."""
+
+        segments = self._document_segments() if self.document is not None else []
+        previous_key = self._current_segment_key
+        self.articles_tabs.blockSignals(True)
+        while self.articles_tabs.count():
+            widget = self.articles_tabs.widget(0)
+            self.articles_tabs.removeTab(0)
+            widget.deleteLater()
+        for segment in segments:
+            key = self._segment_key(segment)
+            finished = key in self._finished_segment_keys
+            tab_page = QWidget()
+            page_layout = QVBoxLayout(tab_page)
+            page_layout.setContentsMargins(8, 8, 8, 8)
+            summary = QLabel(self._segment_summary(segment))
+            summary.setWordWrap(True)
+            if finished:
+                summary.setStyleSheet("color: #9a9a9a;")
+            page_layout.addWidget(summary)
+            current_marker = " (current)" if key == self._current_segment_key else ""
+            page_layout.addWidget(
+                QLabel(f"{len(segments)} detected; click a tab to make it the working article{current_marker}.")
+            )
+            index = self.articles_tabs.addTab(tab_page, self._segment_tab_title(segment, finished))
+            self.articles_tabs.setTabToolTip(index, self._segment_summary(segment))
+            if key == previous_key:
+                self.articles_tabs.setCurrentIndex(index)
+        if previous_key is None and segments:
+            self.articles_tabs.setCurrentIndex(0)
+        self.articles_tabs.blockSignals(False)
+        if self.document is None:
+            self.articles_hint.setText("Load a PDF to see detected articles.")
+        elif not segments:
+            self.articles_hint.setText("No article segments detected; the PDF exports as one article.")
+        elif len(segments) == 1:
+            self.articles_hint.setText("1 article detected.")
+        else:
+            self.articles_hint.setText(
+                f"{len(segments)} articles detected. Click a tab to work on one; use Merge Current With... for false splits."
+            )
+        self._update_merge_segments_button()
+
+    @staticmethod
+    def _segment_tab_title(segment: dict[str, object], finished: bool) -> str:
+        """Short tab caption: article number plus optional finished marker."""
+
+        number = str(segment.get("abstract_number", "")).strip() or "ABSN"
+        return f"🔒 {number}" if finished else number
+
+    def _on_article_tab_clicked(self, index: int) -> None:
+        """Make the clicked article tab the working article and show its page."""
+
+        segment = self._segment_at_tab(index)
+        if segment is None:
+            return
+        key = self._segment_key(segment)
+        if key not in self._finished_segment_keys:
+            if self._current_segment_key != key:
+                self._current_segment_key = key
+                self._refresh_article_buttons()
+        start_page = int(segment.get("start_page", 1))
+        self.viewer.render_page(start_page - 1)
+        self._log(
+            f"Viewing article {segment.get('index')} "
+            f"(ABSN {segment.get('abstract_number', '')}) from page {start_page}."
+        )
+
+    def _segment_at_tab(self, index: int) -> dict[str, object] | None:
+        """Map a tab index back to its article segment."""
+
+        if index < 0 or index >= self.articles_tabs.count():
+            return None
+        segments = self._document_segments()
+        return segments[index] if 0 <= index < len(segments) else None
+
+    def _show_article_tab_menu(self, position) -> None:
+        """Context menu: merge this article with another detected one."""
+
+        index = self.articles_tabs.tabBar().tabAt(position)
+        segment = self._segment_at_tab(index)
+        if segment is None:
+            return
+        key = self._segment_key(segment)
+        if key in self._finished_segment_keys:
+            QMessageBox.information(
+                self, "Article finished", "Reopen finished articles before merging them."
+            )
+            return
+        menu = QMenu(self)
+        merge_action = menu.addAction(f"Merge ABSN {segment.get('abstract_number', '')} with...")
+        chosen = menu.exec(self.articles_tabs.mapToGlobal(position))
+        if chosen is merge_action:
+            self._current_segment_key = key
+            self._refresh_article_buttons()
+            self.merge_selected_segments()
+
+    def _update_merge_segments_button(self) -> None:
+        """Enable merging while at least two unfinished articles exist."""
+
+        segments = self._document_segments()
+        unfinished = [
+            segment
+            for segment in segments
+            if self._segment_key(segment) not in self._finished_segment_keys
+        ]
+        self.merge_segments_btn.setEnabled(len(unfinished) >= 2)
+
+    def _segment_summary(self, segment: dict[str, object]) -> str:
+        """Describe one detected article as a single readable line."""
+
+        index = segment.get("index", "?")
+        number = str(segment.get("abstract_number", "")).strip() or "ABSN"
+        start = int(segment.get("start_page", 0))
+        end = int(segment.get("end_page", start))
+        pages = f"p{start}" if start == end else f"p{start}-{end}"
+        columns = segment.get("columns") or []
+        column_text = "" if not columns else " col" + ",".join(str(column) for column in columns)
+        state = " | finished" if self._segment_key(segment) in self._finished_segment_keys else ""
+        text = f"{index}. ABSN {number} | {pages}{column_text}{state}"
+        snippet = ""
+        if self.document is not None:
+            title_blocks = sorted(
+                (
+                    block
+                    for block in self.document.blocks
+                    if block.role == "title" and block_matches_segment(block, segment)
+                ),
+                key=reading_order_key,
+            )
+            snippet = " ".join(" ".join(block.text.split()) for block in title_blocks)
+        return f"{text} | {snippet[:70]}" if snippet else text
+
+    def merge_selected_segments(self) -> None:
+        """Fold falsely split articles into the current one after a picker."""
+
+        if self.document is None:
+            return
+        current = self._current_segment()
+        if current is None:
+            QMessageBox.information(
+                self, "No article", "No unfinished article is available as the merge target."
+            )
+            return
+        target_segment, target_key = current
+        if target_key in self._finished_segment_keys:
+            QMessageBox.information(
+                self, "Article finished", "Reopen finished articles before merging them."
+            )
+            return
+        candidates = [
+            segment
+            for segment in self._document_segments()
+            if self._segment_key(segment) != target_key
+            and self._segment_key(segment) not in self._finished_segment_keys
+        ]
+        if not candidates:
+            QMessageBox.information(
+                self, "Nothing to merge", "No other unfinished article was detected."
+            )
+            return
+        chosen = self._choose_merge_candidates(target_segment, candidates)
+        if not chosen:
+            return
+        chosen.append(target_segment)
+        chosen.sort(
+            key=lambda segment: (int(segment.get("start_page", 1)), int(segment.get("index", 0)))
+        )
+        target = chosen[0]
+        # Capture the pre-merge identity before the target is resized; the target
+        # itself must be filtered out by index and then re-added once.
+        merged_keys = {self._segment_key(segment) for segment in chosen}
+        merged_indices = {int(segment.get("index", 0)) for segment in chosen}
+        current_key = self._current_segment_key
+        target["start_page"] = min(int(segment.get("start_page", 1)) for segment in chosen)
+        target["end_page"] = max(
+            int(segment.get("end_page", target["start_page"])) for segment in chosen
+        )
+        column_sets = [list(segment.get("columns") or []) for segment in chosen]
+        target["columns"] = (
+            column_sets[0]
+            if column_sets[0] and all(columns == column_sets[0] for columns in column_sets)
+            else None
+        )
+        remaining = [
+            segment
+            for segment in segments
+            if int(segment.get("index", 0)) not in merged_indices
+        ]
+        remaining.append(target)
+        remaining.sort(
+            key=lambda segment: (int(segment.get("start_page", 1)), int(segment.get("index", 0)))
+        )
+        # Renumbering changes each segment key, so finished/current bookkeeping
+        # is remapped through the old-to-new table.
+        key_map: dict[tuple, tuple] = {}
+        for position, segment in enumerate(remaining, start=1):
+            old_key = self._segment_key(segment)
+            segment["index"] = position
+            new_key = self._segment_key(segment)
+            if old_key is not None and new_key is not None:
+                key_map[old_key] = new_key
+        if current_key in merged_keys:
+            self._current_segment_key = self._segment_key(target)
+        elif current_key is not None:
+            self._current_segment_key = key_map.get(current_key, current_key)
+        self._finished_segment_keys = [key_map.get(key, key) for key in self._finished_segment_keys]
+        self.document.metadata["article_segments"] = remaining
+        self._refresh_article_buttons()
+        self._log(
+            f"Merged {len(chosen)} article segments into one: ABSN "
+            f"{target.get('abstract_number', '')} p{target['start_page']}-{target['end_page']}."
+        )
+
+    def _choose_merge_candidates(
+        self, target_segment: dict[str, object], candidates: list[dict[str, object]]
+    ) -> list[dict[str, object]]:
+        """Ask which other detected articles should fold into the current one."""
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Merge ABSN {target_segment.get('abstract_number', '')} with...")
+        layout = QVBoxLayout(dialog)
+        hint = QLabel(
+            "Select the articles that were split by mistake; they fold into "
+            f"ABSN {target_segment.get('abstract_number', '')}. Ctrl-click for several."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        list_widget = QListWidget()
+        list_widget.setSelectionMode(QListWidget.ExtendedSelection)
+        for segment in candidates:
+            list_widget.addItem(QListWidgetItem(self._segment_summary(segment)))
+        layout.addWidget(list_widget, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.resize(460, 320)
+        if dialog.exec() != QDialog.Accepted:
+            return []
+        rows = sorted({index.row() for index in list_widget.selectedIndexes()})
+        return [candidates[row] for row in rows if 0 <= row < len(candidates)]
 
     def _update_document_model(self) -> None:
         """Build document metadata from user-assigned roles only."""
@@ -1038,8 +1367,25 @@ class MainWindow(QMainWindow):
         self.document.authors = linked.authors
         self.document.corresponding_author = linked.corresponding_author
         self.document.affiliations = linked.affiliations
+        self.document.metadata["link_issues"] = [asdict(issue) for issue in linked.issues]
+        self._refresh_link_review()
         self._rebuild_paragraph_model()
         self._sync_auto_zones()
+
+    def _log_link_issues(self) -> None:
+        """Report the author/affiliation links that need a human decision."""
+
+        if self.document is None:
+            return
+        issues = self.document.metadata.get("link_issues", [])
+        if not issues:
+            return
+        errors = sum(1 for issue in issues if issue.get("severity") == "error")
+        self._log(
+            f"Author/affiliation matching: {errors} error(s), {len(issues) - errors} warning(s)."
+        )
+        for issue in issues:
+            self._log(f"  [{issue.get('severity', 'info')}] {issue.get('message', '')}")
 
     def _document_for_segment(
         self, segment: dict[str, object], source_document: Document | None = None
@@ -1075,14 +1421,8 @@ class MainWindow(QMainWindow):
         metadata["abstract_number_block_ids"] = [str(segment.get("abstract_number_block_id", ""))]
         metadata["article_segment"] = dict(segment)
         metadata.pop("article_segments", None)
-        abstract_number = metadata["abstract_number"]
-        title = self._compose_title(blocks)
-        title = re.sub(
-            rf"^\s*{re.escape(abstract_number)}\s*(?:\||\u2502)\s*",
-            "",
-            title,
-            count=1,
-        ).strip()
+        abstract_number = str(metadata["abstract_number"])
+        title = self._strip_abstract_number_from_title(self._compose_title(blocks), abstract_number)
         title = re.sub(
             r"^\s*\([A-Z][A-Z0-9./-]{1,30}\)\s+",
             "",
@@ -1099,6 +1439,7 @@ class MainWindow(QMainWindow):
             key=reading_order_key,
         )
         linked = self.linker.link_from_blocks(author_blocks, affiliation_blocks)
+        metadata["link_issues"] = [asdict(issue) for issue in linked.issues]
         return Document(
             title=title,
             authors=linked.authors,
@@ -1207,7 +1548,8 @@ class MainWindow(QMainWindow):
         title = " ".join(parts) if parts else self._sanitize_xml_text(top.text)
         # Conference abstracts commonly prefix the title with an identifier such
         # as "(S100)". Keep it in extraction metadata, not in the article title.
-        return re.sub(r"^\s*\([A-Z][A-Z0-9./-]{1,30}\)\s+", "", title, count=1, flags=re.IGNORECASE).strip()
+        title = re.sub(r"^\s*\([A-Z][A-Z0-9./-]{1,30}\)\s+", "", title, count=1, flags=re.IGNORECASE).strip()
+        return self._strip_abstract_number_from_title(title)
 
     def _populate_tree(self) -> None:
         """Populate the structure tree with detected blocks."""
@@ -1530,6 +1872,7 @@ class MainWindow(QMainWindow):
                 ]
             }
 
+        answer_summary: object = None
         try:
             answer_summary = self.openrouter_client.classify(
                 prompt=QUESTION_ANSWER_PROMPT,
@@ -1549,6 +1892,7 @@ class MainWindow(QMainWindow):
             self._log(f"OpenRouter classification failed: {exc}")
             self._log("Falling back to local heuristic classifier for selected blocks.")
             raw_response = local_classifier_response()
+        self._adopt_abstract_number(answer_summary, selected_blocks)
         assignments = self._extract_role_assignments(raw_response)
         if not assignments:
             QMessageBox.information(self, "No changes", "The model did not return usable role assignments.")
@@ -1677,6 +2021,141 @@ class MainWindow(QMainWindow):
             if normalized:
                 return normalized
         return []
+
+    def _adopt_abstract_number(self, answer_summary: object, source_blocks: list | None = None) -> None:
+        """Adopt an abstract number the model separated out of the title.
+
+        The value replaces the regex-detected number so it is exported as the
+        ``ABSN`` itemid and stripped from the article title.
+        """
+
+        if self.document is None or not isinstance(answer_summary, dict):
+            return
+        entry = answer_summary.get("abstract_number")
+        if isinstance(entry, str):
+            raw_value, raw_ids = entry, []
+        elif isinstance(entry, dict):
+            raw_value, raw_ids = entry.get("text", ""), entry.get("block_ids", [])
+        else:
+            return
+        abstract_number = self._normalize_abstract_number(raw_value)
+        if not abstract_number:
+            return
+        blocks = source_blocks if source_blocks is not None else self.document.blocks
+        haystack = " ".join(str(block.text) for block in blocks)
+        if not re.search(re.escape(abstract_number), haystack, flags=re.IGNORECASE):
+            self._log(
+                f"Ignored model abstract number {abstract_number}: not present in the selected text."
+            )
+            return
+        candidate_ids = [str(block_id) for block_id in raw_ids] if isinstance(raw_ids, list) else []
+        blocks_by_id = {block.id: block for block in self.document.blocks}
+        # Only exclude blocks that hold nothing but the marker; a title block that
+        # merely starts with the number must survive and be trimmed instead.
+        marker_ids = [
+            block_id
+            for block_id in candidate_ids
+            if block_id in blocks_by_id
+            and self._is_abstract_number_marker(blocks_by_id[block_id].text, abstract_number)
+        ]
+        if marker_ids:
+            self.document.metadata["abstract_number_block_ids"] = marker_ids
+        target: dict[str, object] | None = None
+        for segment in self._document_segments():
+            if any(
+                block_id in blocks_by_id and block_matches_segment(blocks_by_id[block_id], segment)
+                for block_id in candidate_ids
+            ):
+                target = segment
+                break
+        if target is None:
+            current = self._current_segment()
+            target = current[0] if current else None
+        self._set_abstract_number(abstract_number, target)
+        if target is not None and marker_ids:
+            target["abstract_number_block_id"] = marker_ids[0]
+        self._refresh_article_buttons()
+        self._log(f"Adopted abstract number {abstract_number} from the model answer.")
+
+    def _set_abstract_number(self, abstract_number: str, target: dict[str, object] | None) -> None:
+        """Store an abstract number on the document and, when known, its segment.
+
+        Changing the segment value changes its key, so the current and finished
+        article bookkeeping is remapped to match.
+        """
+
+        previous = self._normalize_abstract_number(self.document.metadata.get("abstract_number", ""))
+        if previous and previous.casefold() != abstract_number.casefold():
+            # Keep the old marker so a correcting edit still trims it off the title.
+            aliases = self.document.metadata.get("abstract_number_aliases")
+            if not isinstance(aliases, list):
+                aliases = []
+            if previous not in aliases:
+                aliases.append(previous)
+            self.document.metadata["abstract_number_aliases"] = aliases
+        self.document.metadata["abstract_number"] = abstract_number
+        if target is None:
+            return
+        old_key = self._segment_key(target)
+        target["abstract_number"] = abstract_number
+        new_key = self._segment_key(target)
+        if old_key is None or new_key is None or old_key == new_key:
+            return
+        if self._current_segment_key == old_key:
+            self._current_segment_key = new_key
+        self._finished_segment_keys = [
+            new_key if key == old_key else key for key in self._finished_segment_keys
+        ]
+
+    @staticmethod
+    def _normalize_abstract_number(value: object) -> str:
+        """Return a bare abstract number, or an empty string when unusable."""
+
+        cleaned = str(value or "").strip().strip("()[] \t")
+        if not cleaned or cleaned.upper() == "ABSN":
+            return ""
+        if any(character.isspace() for character in cleaned):
+            return ""
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9./-]{0,29}", cleaned):
+            return ""
+        return cleaned
+
+    @staticmethod
+    def _is_abstract_number_marker(text: str, abstract_number: str) -> bool:
+        """Return true when a block holds nothing but the abstract-number marker."""
+
+        remainder = re.sub(
+            r"(?:abstract\s*(?:no\.?|number|nr\.?|id)?|absn)\s*[:#-]?",
+            " ",
+            text,
+            flags=re.IGNORECASE,
+        )
+        remainder = re.sub(re.escape(abstract_number), " ", remainder, flags=re.IGNORECASE)
+        return not re.search(r"[A-Za-z0-9]", remainder)
+
+    def _strip_abstract_number_from_title(self, title: str, abstract_number: str | None = None) -> str:
+        """Remove a leading abstract-number marker from an article title."""
+
+        if abstract_number is None:
+            abstract_number = self.document.abstract_number() if self.document is not None else ""
+        numbers = [str(abstract_number).strip()]
+        if self.document is not None:
+            aliases = self.document.metadata.get("abstract_number_aliases")
+            if isinstance(aliases, list):
+                # A corrected abstract number must still remove the marker left
+                # behind by the earlier, wrong one.
+                numbers.extend(str(alias).strip() for alias in aliases)
+        for number in numbers:
+            if not number or number.upper() == "ABSN":
+                continue
+            title = re.sub(
+                rf"^\s*[\(\[]?{re.escape(number)}[\)\]]?\s*(?:\||\u2502|[:.\-\u2013\u2014])?\s+",
+                "",
+                title,
+                count=1,
+                flags=re.IGNORECASE,
+            ).strip()
+        return title
 
     def _merge_blocks_by_ids(self, selected_ids: set[str]) -> None:
         """Merge a set of explicitly selected blocks."""
@@ -2178,12 +2657,19 @@ class MainWindow(QMainWindow):
             self._selected_block_ids = {block_id}
             self.viewer.set_selected_blocks(self._selected_block_ids, block_id)
             self._update_selection_status()
+        # Standard inspector behavior: selecting a block anywhere (viewer,
+        # tree, preview, review navigation) reveals its properties tab.
+        self._show_work_tab(self.TAB_PROPERTIES)
         self.props.fields["Text"].setText(block.text)
         self.props.fields["Font"].setText(block.font_name or "-")
         self.props.fields["Font Size"].setText(f"{block.font_size:.1f}")
-        self.props.fields["Coordinates"].setText(str(block.bbox))
+        # One decimal keeps long float lists readable and wrappable in the form.
+        coords = ", ".join(f"{value:.1f}" for value in block.bbox)
+        self.props.fields["Coordinates"].setText(f"x{coords} @ p{block.page}")
         self.props.fields["Page"].setText(str(block.page))
-        self.props.fields["Confidence"].setText(f"{block.confidence:.2f}")
+        role_source = str((block.metadata or {}).get("role_source", "") or "")
+        confidence_label = f"{block.confidence:.2f}" + (f" ({role_source})" if role_source else "")
+        self.props.fields["Confidence"].setText(confidence_label)
         self.props.fields["Detected Role"].setText(block.role)
         self.props.set_role(block.role, locked=self._article_locked(block))
         self._update_merged_details(block)
@@ -2328,7 +2814,7 @@ class MainWindow(QMainWindow):
         self.tree.blockSignals(False)
         self._update_selection_status()
         self._update_selection_panel()
-        self.props.set_merge_details(None)
+        self.metadata_panel.set_merge_details(None)
         self.props.set_role(None)
 
     def _load_pdf_path(self, path: str) -> None:
@@ -2354,6 +2840,7 @@ class MainWindow(QMainWindow):
                 f"{refine_report.review_count} need review."
             )
         self._update_document_model()
+        self._log_link_issues()
         self.viewer.load_pdf(path)
         self.viewer.set_blocks([asdict(block) for block in self.document.blocks])
         self._selected_block_ids.clear()
@@ -2370,7 +2857,7 @@ class MainWindow(QMainWindow):
         self._log(f"Loaded {path}")
         self._log(f"Detected {len(self.document.blocks)} text blocks")
         self._log(f"Pipeline report written to {report_path}")
-        self.props.set_merge_details(None)
+        self.metadata_panel.set_merge_details(None)
         self.props.set_role(None)
         self._refresh_article_buttons()
 
@@ -2380,7 +2867,7 @@ class MainWindow(QMainWindow):
         metadata = block.metadata or {}
         merged_ids = metadata.get("merged_block_ids")
         if not merged_ids:
-            self.props.set_merge_details(None)
+            self.metadata_panel.set_merge_details(None)
             return
         details = {
             "Block ID": block.id,
@@ -2388,7 +2875,7 @@ class MainWindow(QMainWindow):
             "Merge Source": str(metadata.get("merge_source", "unknown")),
             "Merged From": ", ".join(str(item) for item in merged_ids),
         }
-        self.props.set_merge_details(details)
+        self.metadata_panel.set_merge_details(details)
 
     def _on_viewer_zone_selected(self, zone_id: str, additive: bool = False) -> None:
         """Select a zone from the PDF viewer."""
@@ -2487,6 +2974,30 @@ class MainWindow(QMainWindow):
         zone_locked = any(self._article_locked(block) for block in self._blocks_for_zone(zone))
         self.props.set_locked_state(zone_locked)
         self.props.apply_role_btn.setEnabled(not zone_locked)
+
+    def apply_abstract_number(self) -> None:
+        """Apply the reviewed abstract number to the current article."""
+
+        if self.document is None:
+            QMessageBox.information(self, "No document", "Load a PDF first.")
+            return
+        value = self.metadata_panel.abstract_number_editor.text().strip()
+        if value and not self._normalize_abstract_number(value):
+            QMessageBox.warning(
+                self,
+                "Invalid abstract number",
+                "Enter a single identifier such as \"4349\" or \"S100\" without spaces or labels.",
+            )
+            return
+        abstract_number = self._normalize_abstract_number(value) or "ABSN"
+        current = self._current_segment()
+        self._set_abstract_number(abstract_number, current[0] if current else None)
+        self._update_document_model()
+        self.viewer.set_blocks([asdict(block) for block in self.document.blocks])
+        self._populate_tree()
+        self._update_html_preview()
+        self._refresh_article_buttons()
+        self._log(f"Set abstract number to {abstract_number}.")
 
     def apply_selected_block_role(self) -> None:
         """Assign the chosen role to the current selected block."""

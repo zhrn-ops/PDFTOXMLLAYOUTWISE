@@ -6,6 +6,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
+    QHeaderView,
     QStyledItemDelegate,
     QTreeWidget,
     QTreeWidgetItem,
@@ -49,8 +50,13 @@ class StructureTree(QTreeWidget):
         self.setAlternatingRowColors(True)
         self.setUniformRowHeights(True)
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.setColumnWidth(0, 320)
-        self.setColumnWidth(1, 180)
+        # Stretch both columns within the pane instead of fixed widths so the
+        # editable Role column stays reachable in narrow splitters.
+        header = self.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setStretchLastSection(True)
         self.setItemDelegateForColumn(1, RoleDelegate(self))
         self.categories: dict[str, QTreeWidgetItem] = {}
         for label in ["Title", "Authors", "Corresponding Author", "Affiliations", "Abstract"]:

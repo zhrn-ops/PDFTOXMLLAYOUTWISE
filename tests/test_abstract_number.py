@@ -40,3 +40,45 @@ def test_lowercase_body_token_is_not_an_abstract_number():
 
     assert number == ""
     assert block_ids == []
+
+
+def test_parenthesized_drug_abbreviation_is_not_an_abstract_number():
+    # A wrapped title line can start with a parenthesized drug abbreviation.
+    number, block_ids = PDFExtractor(use_docling=False)._extract_abstract_number(
+        [_block("(POM) VS DARA PLUS POM AND DEXAMETHASONE (DPD)")]
+    )
+
+    assert number == ""
+    assert block_ids == []
+
+
+def test_parenthesized_affiliation_is_not_an_abstract_number():
+    number, block_ids = PDFExtractor(use_docling=False)._extract_abstract_number(
+        [_block("(Ichilov) Medical Center, Tel Aviv, Israel")]
+    )
+
+    assert number == ""
+    assert block_ids == []
+
+
+def test_license_footer_saying_abstract_book_is_not_a_marker():
+    markers = PDFExtractor(use_docling=False)._extract_abstract_numbers(
+        [_block("Abstract Book distributed under the Attribution-NonCommercial-NoDerivs license")]
+    )
+
+    assert markers == []
+
+
+def test_only_markers_containing_a_digit_are_detected():
+    markers = PDFExtractor(use_docling=False)._extract_abstract_numbers(
+        [_block("(S100) PHASE 3 STUDY", "block_001"), _block("(POM) CONTINUATION", "block_002")]
+    )
+
+    assert [marker["abstract_number"] for marker in markers] == ["S100"]
+
+
+def test_inline_marker_beside_title_text_is_not_a_dedicated_block():
+    extractor = PDFExtractor(use_docling=False)
+
+    assert not extractor._is_abstract_number_only("(S100) PHASE 3, RANDOMIZED STUDY", "S100")
+    assert extractor._is_abstract_number_only("Abstract No: 4349", "4349")

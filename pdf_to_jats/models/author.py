@@ -14,3 +14,5 @@ class Author:
     display_name: str = ""
     given_names: str = ""
     affiliation_ids: list[str] = field(default_factory=list)
+    id: str = ""
+    markers: list[str] = field(default_factory=list)

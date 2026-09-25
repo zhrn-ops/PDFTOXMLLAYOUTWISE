@@ -139,6 +139,7 @@ class Document:
                 for author in self.authors
             ],
             "affiliations": [asdict(aff) for aff in self.affiliations],
+            "link_issues": list(self.metadata.get("link_issues", [])),
             "filtered_block_ids": sorted(excluded_ids),
             "metadata": dict(self.metadata),
         }

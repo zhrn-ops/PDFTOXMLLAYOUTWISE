@@ -9,6 +9,9 @@ QUESTION_ANSWER_PROMPT = (
     "- What are the affiliations? There may be multiple affiliations, and they may appear as a list.\n"
     "  Return each affiliation as a separate institution string if possible.\n"
     "- What is the abstract?\n"
+    "- What is the abstract number? Conference abstracts often print an identifier such as\n"
+    "  \"4349\", \"Abstract No: 4349\", or \"(S100)\" before, inside, or next to the title line.\n"
+    "  Return the bare identifier only, without labels such as \"Abstract No\".\n"
     "- What text does not belong to these metadata fields?\n"
     "\n"
     "Return JSON only in this form:\n"
@@ -17,9 +20,13 @@ QUESTION_ANSWER_PROMPT = (
     '  "authors": {"block_ids": ["block_002", "block_003"], "text": "...", "items": ["R.M. Ram mohan", "L. Pannikodu"]},\n'
     '  "affiliations": {"block_ids": ["block_003", "block_004"], "text": "...", "items": ["Nassau University Medical Center", "East Meadow, United States of America"]},\n'
     '  "abstract": {"block_ids": ["block_004"], "text": "..."},\n'
+    '  "abstract_number": {"block_ids": ["block_001"], "text": "4349"},\n'
     '  "unclassified": {"block_ids": ["block_005"], "text": "..."}\n'
     "}\n"
     "Use only block_ids that appear in the payload.\n"
+    "When the abstract number appears inside the title, strip it from title.text and return it as\n"
+    "abstract_number.text; it becomes the ABSN itemid, so it must never remain in the title.\n"
+    "If no abstract number is present, omit abstract_number.\n"
     "structural_evidence is an advisory Docling interpretation; treat the block text and PyMuPDF layout fields as the source evidence.\n"
     "If you can separate individual authors or affiliations, put them in items in reading order.\n"
     "Do not include explanations."
@@ -32,6 +39,9 @@ MARKDOWN_QUESTION_ANSWER_PROMPT = (
     "- Who are the authors?\n"
     "- What are the affiliations?\n"
     "- What is the abstract?\n"
+    "- What is the abstract number? Conference abstracts often print an identifier such as\n"
+    "  \"4349\", \"Abstract No: 4349\", or \"(S100)\" before, inside, or next to the title line.\n"
+    "  Return the bare identifier only, without labels such as \"Abstract No\".\n"
     "- What text does not belong to these metadata fields?\n"
     "\n"
     "The transcript preserves block ids inline as markdown bullets.\n"
@@ -41,16 +51,20 @@ MARKDOWN_QUESTION_ANSWER_PROMPT = (
     '  "authors": {"block_ids": ["block_002", "block_003"], "text": "...", "items": ["R.M. Ram mohan", "L. Pannikodu"]},\n'
     '  "affiliations": {"block_ids": ["block_003", "block_004"], "text": "...", "items": ["Nassau University Medical Center", "East Meadow, United States of America"]},\n'
     '  "abstract": {"block_ids": ["block_004"], "text": "..."},\n'
+    '  "abstract_number": {"block_ids": ["block_001"], "text": "4349"},\n'
     '  "unclassified": {"block_ids": ["block_005"], "text": "..."}\n'
     "}\n"
     "Use only block_ids that appear in the transcript.\n"
+    "When the abstract number appears inside the title, strip it from title.text and return it as\n"
+    "abstract_number.text; it becomes the ABSN itemid, so it must never remain in the title.\n"
+    "If no abstract number is present, omit abstract_number.\n"
     "If you can separate individual authors or affiliations, put them in items in reading order.\n"
     "Do not include explanations."
 )
 
 ROLE_ASSIGNMENT_PROMPT = (
     "You are a scientific document metadata extraction classifier.\n"
-    "You will receive text blocks and a prior answer summary for title, authors, affiliations, abstract, and unclassified text.\n"
+    "You will receive text blocks and a prior answer summary for title, authors, affiliations, abstract, abstract number, and unclassified text.\n"
     "Use the answer summary as evidence and assign exactly one role to each block_id.\n"
     "\n"
     "Roles:\n"
@@ -67,6 +81,7 @@ ROLE_ASSIGNMENT_PROMPT = (
     "- Prefer author for person names or author lists. There may be multiple author blocks, and author order matters.\n"
     "- Prefer affiliation for institutional text or affiliation lists. There may be multiple affiliation blocks, and affiliation order matters.\n"
     "- Prefer abstract only for the abstract section and its heading when clearly present.\n"
+    "- A block whose only content is an abstract-number marker such as \"4349\" or \"(S100)\" is an itemid, not the title: prefer unclassified for it.\n"
     "- If a block could fit more than one role, choose the most specific role.\n"
     "- If uncertain, choose unclassified.\n"
     "\n"

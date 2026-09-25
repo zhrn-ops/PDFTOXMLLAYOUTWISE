@@ -138,9 +138,20 @@ class PDFExtractor:
         document.raw_blocks = [replace(block, metadata=dict(block.metadata)) for block in document.blocks]
         abstract_numbers = self._extract_abstract_numbers(document.blocks)
         if abstract_numbers:
-            first_number = abstract_numbers[0]["abstract_number"]
-            document.metadata["abstract_number"] = first_number
-            document.metadata["abstract_number_block_ids"] = [abstract_numbers[0]["block_id"]]
+            first_marker = abstract_numbers[0]
+            document.metadata["abstract_number"] = first_marker["abstract_number"]
+            # Only a block holding nothing but the marker may be dropped from the
+            # article body; an inline marker such as "(S100) PHASE 3 ..." lives
+            # inside the title line and must stay.
+            marker_block = next(
+                (block for block in document.blocks if block.id == first_marker["block_id"]), None
+            )
+            document.metadata["abstract_number_block_ids"] = (
+                [first_marker["block_id"]]
+                if marker_block is not None
+                and self._is_abstract_number_only(marker_block.text, first_marker["abstract_number"])
+                else []
+            )
             document.metadata["article_segments"] = self._build_article_segments(
                 abstract_numbers,
                 max((block.page for block in document.blocks), default=1),
@@ -258,6 +269,35 @@ class PDFExtractor:
             return True
         return False
 
+    @staticmethod
+    def _is_plausible_abstract_number(value: str) -> bool:
+        """Return true only for tokens that look like a conference identifier.
+
+        Abstract numbers such as ``S100``, ``4349``, or ``P12.3`` carry a digit.
+        Stray parenthesized words from a title or affiliation (``(POM)``,
+        ``(Ichilov)``) and prose like ``Abstract Book`` do not, and must not be
+        mistaken for markers that split one PDF into several articles.
+        """
+
+        if not value or not (value[0].isupper() or value[0].isdigit()):
+            return False
+        if not re.fullmatch(r"[A-Z0-9][A-Z0-9./-]{1,30}", value, flags=re.IGNORECASE):
+            return False
+        return any(character.isdigit() for character in value)
+
+    @staticmethod
+    def _is_abstract_number_only(text: str, abstract_number: str) -> bool:
+        """Return true when a block holds nothing but the abstract-number marker."""
+
+        remainder = re.sub(
+            r"(?:abstract\s*(?:no\.?|number|nr\.?|id)?|absn)\s*[:#-]?",
+            " ",
+            text,
+            flags=re.IGNORECASE,
+        )
+        remainder = re.sub(re.escape(abstract_number), " ", remainder, flags=re.IGNORECASE)
+        return not re.search(r"[A-Za-z0-9]", remainder)
+
     def _extract_abstract_number(self, blocks: list[TextBlock]) -> tuple[str, list[str]]:
         """Find a conference abstract number from the earliest content blocks."""
 
@@ -278,10 +318,7 @@ class PDFExtractor:
                 match = re.search(pattern, cleaned, flags=re.IGNORECASE)
                 if match:
                     value = match.group(1).strip(" ,;:.-")
-                    if value and (value[0].isupper() or value[0].isdigit()) and (
-                        pattern.startswith("^\\s*(\\d{3,6})")
-                        or re.fullmatch(r"[A-Z0-9][A-Z0-9./-]{1,30}", value, flags=re.IGNORECASE)
-                    ):
+                    if self._is_plausible_abstract_number(value):
                         return value, [block.id]
         return "", []
 
@@ -303,7 +340,7 @@ class PDFExtractor:
                     continue
                 value = match.group(1).strip(" ,;:.-")
                 key = value.casefold()
-                if value and (value[0].isupper() or value[0].isdigit()) and key not in seen:
+                if self._is_plausible_abstract_number(value) and key not in seen:
                     markers.append({"abstract_number": value, "page": block.page, "block_id": block.id})
                     seen.add(key)
                 break

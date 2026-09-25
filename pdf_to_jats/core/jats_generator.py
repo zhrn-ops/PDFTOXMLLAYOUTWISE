@@ -124,23 +124,46 @@ class JATSGenerator:
         titletext.set("original", "y")
         titletext.text = self._sanitize_title(document.title, document.abstract_number()) or "Untitled"
 
-        author_group = etree.SubElement(head, self._qname("author-group"))
-        author_group.set("seq", "1")
-        for idx, author in enumerate(document.authors, start=1):
-            author_el = etree.SubElement(author_group, self._qname("author"))
-            author_el.set("seq", str(idx))
-            initials = self._sanitize_xml_text(author.initials)
-            surname = self._sanitize_xml_text(author.surname)
-            if not initials or not surname:
-                initials, surname = self._split_name(author.display_name or f"{author.initials} {author.surname}".strip())
-            etree.SubElement(author_el, self._qname("initials", self.CE_NS)).text = initials
-            etree.SubElement(author_el, self._qname("surname", self.CE_NS)).text = surname
-
-        for aff in document.affiliations:
-            affiliation = etree.SubElement(author_group, self._qname("affiliation"))
-            self._append_affiliation_text(affiliation, aff.text)
+        for seq, (affiliation, group_authors) in enumerate(self._author_groups(document), start=1):
+            author_group = etree.SubElement(head, self._qname("author-group"))
+            author_group.set("seq", str(seq))
+            for author_seq, author in enumerate(group_authors, start=1):
+                author_el = etree.SubElement(author_group, self._qname("author"))
+                author_el.set("seq", str(author_seq))
+                initials = self._sanitize_xml_text(author.initials)
+                surname = self._sanitize_xml_text(author.surname)
+                if not initials or not surname:
+                    initials, surname = self._split_name(author.display_name or f"{author.initials} {author.surname}".strip())
+                etree.SubElement(author_el, self._qname("initials", self.CE_NS)).text = initials
+                etree.SubElement(author_el, self._qname("surname", self.CE_NS)).text = surname
+            if affiliation is not None:
+                affiliation_el = etree.SubElement(author_group, self._qname("affiliation"))
+                self._append_affiliation_text(affiliation_el, affiliation.text)
 
         self._append_correspondence(head, document)
+
+    def _author_groups(self, document: Document) -> list[tuple[Any, list[Any]]]:
+        """Group authors under the affiliation each of them references.
+
+        ANI expresses the author/affiliation link structurally, so every
+        ``<author-group>`` carries one affiliation plus the authors pointing at
+        it. An author with several affiliations is repeated in each of their
+        groups, and authors with none are emitted last without an affiliation so
+        they are not silently dropped.
+        """
+
+        groups: list[tuple[Any, list[Any]]] = []
+        for affiliation in document.affiliations:
+            # Unreferenced affiliations are still emitted; the linker reports
+            # them rather than letting them vanish from the output.
+            members = [
+                author for author in document.authors if affiliation.id in author.affiliation_ids
+            ]
+            groups.append((affiliation, members))
+        unassigned = [author for author in document.authors if not author.affiliation_ids]
+        if unassigned:
+            groups.append((None, unassigned))
+        return groups
 
         if document.abstract:
             abstracts = etree.SubElement(head, self._qname("abstracts"))
@@ -265,12 +288,13 @@ class JATSGenerator:
         text = re.sub(r"\s+", " ", self._sanitize_xml_text(value)).strip()
         if not text:
             return ""
-        if abstract_number:
+        if abstract_number and abstract_number.upper() != "ABSN":
             text = re.sub(
-                rf"^\s*{re.escape(abstract_number)}\s*(?:\||\u2502)\s*",
+                rf"^\s*[\(\[]?{re.escape(abstract_number)}[\)\]]?\s*(?:\||\u2502|[:.\-\u2013\u2014])?\s+",
                 "",
                 text,
                 count=1,
+                flags=re.IGNORECASE,
             )
         text = re.sub(r"^\s*doi:\s*\S+\s*", "", text, flags=re.IGNORECASE)
         text = re.sub(r"\bA\s*B\s*S\s*T\s*R\s*A\s*C\s*T\b", "", text, flags=re.IGNORECASE)
