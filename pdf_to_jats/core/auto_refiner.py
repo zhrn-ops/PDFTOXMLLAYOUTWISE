@@ -22,6 +22,34 @@ def is_abstract_heading(text: str) -> bool:
     return bool(re.fullmatch(r"abstract(?:\s+(?:no\.?\s*)?[\w-]{1,30})?", cleaned, re.IGNORECASE))
 
 
+def abstract_number_marker(text: str) -> str:
+    """Return the identifier when a block holds nothing but an abstract-number marker.
+
+    Conference abstracts print the identifier as ``Abstract No: 4349``,
+    ``ABSN 4349``, or ``(S100)``. Only these labelled or parenthesised forms
+    count: a bare token such as ``4349`` is ambiguous with a page number, and
+    a marker surrounded by other words means the block is a title or body line
+    that merely begins with the identifier.
+    """
+
+    cleaned = " ".join(str(text or "").split())
+    match = re.fullmatch(
+        r"(?:abstract\s*(?:no\.?|number|nr\.?|id)\s*[:#-]?|absn\s*[:#-]?)\s*"
+        r"\(?([A-Za-z0-9][A-Za-z0-9./-]{0,30})\)?"
+        r"|\(([A-Za-z0-9][A-Za-z0-9./-]{0,30})\)",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return ""
+    value = next((group for group in match.groups() if group), "")
+    if not value or not any(character.isdigit() for character in value):
+        return ""
+    if not (value[0].isupper() or value[0].isdigit()):
+        return ""
+    return value
+
+
 # Postal address tails such as "Philadelphia, PA, USA" that arrive as their own
 # block when an affiliation wraps across lines.
 _COUNTRY_MARKER = re.compile(
@@ -160,6 +188,12 @@ class AutoRefiner:
     # ------------------------------------------------------------------
 
     def _refine_title(self, block: TextBlock, text: str, lowered: str) -> str:
+        if self._KEYWORDS_PREFIX.match(text):
+            return "keywords"
+        if abstract_number_marker(text):
+            # The classifier scores a marker such as "(S100)" as a title
+            # because it sits near the top of the page in a large font.
+            return "abstract_number"
         if self._ABSTRACT_HEADING.fullmatch(text.strip()):
             return "abstract"
         if self._HEADER_NOISE.match(text):
@@ -190,6 +224,10 @@ class AutoRefiner:
         return "title"
 
     def _refine_abstract(self, block: TextBlock, text: str, lowered: str) -> str:
+        # A marker labelled "Abstract No: 4349" scores as abstract text but is
+        # an itemid, so it must not be exported as part of the abstract.
+        if abstract_number_marker(text):
+            return "abstract_number"
         return "abstract"
 
     def _refine_author(self, block: TextBlock, text: str, lowered: str) -> str:
@@ -210,6 +248,8 @@ class AutoRefiner:
         return block.role
 
     def _refine_unclassified(self, block: TextBlock, text: str, lowered: str) -> str:
+        if abstract_number_marker(text):
+            return "abstract_number"
         if self._SECTION_HEADINGS.match(text):
             return "unclassified"
         return block.role

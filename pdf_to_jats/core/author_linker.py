@@ -41,6 +41,27 @@ _SURNAME_MARKER_AUTHOR = re.compile(
 # institution directly in the author line instead of a numbered list.
 _AUTHOR_INSTITUTION_SPLIT = re.compile(r",\s*(?=(?:[A-Z][A-Za-z'’\-]+\s+){0,3}(?:University|Universit\u00e4t|Institute|Institut|Hospital|College|Center|Centre|School|Laborator|Foundation|Department|Academy))")
 
+# Institution vocabulary: text carrying any of these is never a personal name,
+# so a wrapped affiliation tail cannot become an "author" called
+# "Headache Center" when its line is treated as an address.
+_INSTITUTION_WORDS = re.compile(
+    r"\b(?:university|universit\u00e4t|institute|hospital|college|center|centre|school|"
+    r"laborator|foundation|department|academy|medical|clinic|health|society|association)\b",
+    re.IGNORECASE,
+)
+
+# Acronym institutions ("MIT", "WHO", "NCI") carry no keyword for the split
+# to see, so a tail that is one uppercase token is the institution on its line.
+# Letters only: initials with a marker ("S.J.1") are part of the author name.
+_INSTITUTION_TOKEN = re.compile(r"[A-Z]{2,6}\.?")
+
+# Post-nominals: "Jane Doe, PhD" names one person and awards a degree.
+_DEGREE_SUFFIX = re.compile(
+    r"(?:ph\.?d|m\.?d|m\.?s(?:c)?|b\.?s(?:c)?|d\.?phil|m\.?b\.?b\.?s|d\.?v\.?m|"
+    r"m\.?b\.?a|r\.?n|m\.?p\.?h)\.?",
+    re.IGNORECASE,
+)
+
 # Superscript digits arrive as their own code points when a PDF keeps the
 # raised glyph; flatten them so one marker vocabulary is enough.
 _SUPERSCRIPT_DIGITS = str.maketrans("¹²³⁴⁵⁶⁷⁸⁹⁰", "1234567890")
@@ -89,11 +110,13 @@ def split_author_institution(text: str) -> tuple[list[str], list[str]]:
     parts = _AUTHOR_INSTITUTION_SPLIT.split(cleaned)
     if len(parts) == 1:
         return [cleaned], []
-    authors = [part.strip(" ,;") for part in parts if part.strip(" ,;")]
-    # The institution is the last split part; everything before it is names.
-    institution = parts[-1].strip(" ,;")
-    authors = [part.strip(" ,;") for part in parts[:-1] if part.strip(" ,;")]
-    return authors, [institution] if institution else []
+    # Every split point sits in front of an institution keyword, so the head is
+    # the names and each remaining part is one institution. Taking "all but the
+    # last" instead would turn "A, B University, C Institute" into an author
+    # called "B University".
+    head = parts[0].strip(" ,;")
+    institutions = [part.strip(" ,;") for part in parts[1:] if part.strip(" ,;")]
+    return ([head] if head else []), institutions
 
 
 @dataclass(slots=True)
@@ -156,28 +179,34 @@ class AuthorLinker:
 
     def link_from_texts(self, authors_text: list[str], affiliations_text: list[str]) -> LinkedAuthors:
         issues: list[LinkIssue] = []
-        # Journal-style lines combine the name with the institution; split them
-        # first and collect the institutional tails as extra affiliations.
-        expanded_authors: list[str] = []
-        embedded_affiliations: list[str] = []
+        # Journal-style lines combine the name with the institution. Each
+        # printed entry is split first (entries are ";"-separated) and the
+        # names are remembered together with the institution on their own line:
+        # that provenance is the only link available when the citation prints
+        # no markers, and it beats assuming nothing at all.
+        entry_names: list[list[str]] = []
+        entry_institutions: list[list[str]] = []
         for text in authors_text:
-            names, institutions = split_author_institution(text)
-            if institutions:
-                expanded_authors.extend(names)
-                embedded_affiliations.extend(institutions)
-            elif looks_like_address(text):
-                # A wrapped address tail that landed in an author block is
-                # affiliation data; parsing it as names produced "authors" such
-                # as "Los Angeles" and "San Diego".
-                embedded_affiliations.append(text)
-            else:
-                expanded_authors.append(text)
+            for entry in self._split_entries(text):
+                names, institutions = self._split_entry(entry)
+                if names or institutions:
+                    entry_names.append(names)
+                    entry_institutions.append(institutions)
+
+        expanded_authors = [
+            (index, name) for index, names in enumerate(entry_names) for name in names
+        ]
+        embedded = [
+            (index, institution)
+            for index, institutions in enumerate(entry_institutions)
+            for institution in institutions
+        ]
 
         # Pass 1 collects the author names and markers; pass 2 needs that marker
         # set to tell a lettered affiliation label ("a Alpha") from ordinary
         # text ("Alpha Institute").
-        parsed: list[tuple[str, list[str]]] = []
-        for text in expanded_authors:
+        parsed: list[tuple[str, list[str], int]] = []
+        for entry_index, text in expanded_authors:
             for author_text in self._split_author_list(text):
                 name, markers = self._parse_author_chunk(author_text)
                 if not name and markers:
@@ -189,19 +218,36 @@ class AuthorLinker:
                     continue
                 if not self._is_valid_author_candidate(name or author_text):
                     continue
-                parsed.append((name or author_text, markers))
+                parsed.append((name or author_text, markers, entry_index))
 
-        known_markers = {marker for _name, markers in parsed for marker in markers}
-        affiliations = self._build_affiliations(
-            [*affiliations_text, *embedded_affiliations], known_markers
-        )
+        known_markers = {
+            marker for _name, markers, _entry in parsed for marker in markers
+        }
+        affiliations = self._build_affiliations(affiliations_text, known_markers)
+
+        # Embedded institutions are complete as printed: unlike a wrapped
+        # affiliation block they never fold into the entry above, and they
+        # reuse an affiliation the PDF already prints on its own instead of
+        # duplicating it.
+        embedded_ids: dict[int, list[str]] = {}
+        inline_ids: set[str] = set()
+        for entry_index, institution in embedded:
+            affiliation = self._add_embedded_affiliation(
+                affiliations, institution, known_markers
+            )
+            embedded_ids.setdefault(entry_index, []).append(affiliation.id)
+            if entry_names[entry_index]:
+                # Printed on a line that also carries a name: this institution
+                # belongs to that author alone and must not be handed round.
+                inline_ids.add(affiliation.id)
+
         marker_to_id: dict[str, str] = {}
         for affiliation in affiliations:
             for marker in affiliation.markers:
                 marker_to_id.setdefault(marker, affiliation.id)
 
         authors: list[Author] = []
-        for index, (name, markers) in enumerate(parsed, start=1):
+        for index, (name, markers, _entry) in enumerate(parsed, start=1):
             given_names, initials, surname = self._split_name(name)
             authors.append(
                 Author(
@@ -217,9 +263,90 @@ class AuthorLinker:
         for author in authors:
             author.affiliation_ids = self._resolve_marker_ids(author.markers, marker_to_id)
 
-        self._apply_matching_rules(authors, affiliations, issues)
+        # Printed markers win; the institution sharing the author's line fills
+        # in the links the citation never printed.
+        for author, (_name, _markers, entry_index) in zip(authors, parsed):
+            for affiliation_id in embedded_ids.get(entry_index, ()):
+                if affiliation_id not in author.affiliation_ids:
+                    author.affiliation_ids.append(affiliation_id)
+
+        self._apply_matching_rules(authors, affiliations, issues, inline_ids)
         self._order_affiliations(authors, affiliations)
         return LinkedAuthors(authors=authors, affiliations=affiliations, issues=issues)
+
+    @staticmethod
+    def _split_entries(text: str) -> list[str]:
+        """Split a block into the entries its punctuation separates.
+
+        Semicolons delimit author entries (``"J. Smith, Boston University;
+        A. Lee, MIT"``), and a line break delimits a wrapped byline row. Both
+        must split before the institution split runs: applying that split to a
+        whole block swallowed every name printed after the first institution.
+        """
+
+        raw = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+        return [
+            cleaned
+            for part in re.split(r"[;\n]", raw)
+            if (cleaned := " ".join(part.split()).strip(" ,;"))
+        ]
+
+    def _split_entry(self, entry: str) -> tuple[list[str], list[str]]:
+        """Split one entry into its names and its affiliations."""
+
+        names, institutions = split_author_institution(entry)
+        if institutions:
+            return names, institutions
+        if looks_like_address(entry):
+            # An address tail that landed in an author block is affiliation
+            # data, but a personal name in front of it still belongs to the
+            # citation: "Jane Doe, Philadelphia, PA, USA" keeps Jane Doe.
+            return self._split_address_entry(entry)
+        head, separator, tail = entry.partition(",")
+        if not separator:
+            # A line holding only an institution: a wrapped affiliation whose
+            # author sits on the line above.
+            if _INSTITUTION_WORDS.search(entry) or _INSTITUTION_TOKEN.fullmatch(entry):
+                return [], [entry]
+            return names, institutions
+        if not self._looks_like_person(head):
+            # Wrapped affiliation text with no institution keyword, e.g. an
+            # OCR shard like "4The Los Angeles Headache Center, Los Angeles
+            # and San Diego". Parsing it as names produced authors such as
+            # "Los Angeles" and "San Diego".
+            return [], [entry]
+        tail = tail.strip(" ,;")
+        if tail and not _DEGREE_SUFFIX.fullmatch(tail) and (
+            _INSTITUTION_TOKEN.fullmatch(tail) or _INSTITUTION_WORDS.search(tail)
+        ):
+            # "A. Lee, MIT": the acronym carries no keyword, but it is still
+            # this line's institution, and losing it made the single-affiliation
+            # rule hand Boston University to A. Lee.
+            return [head], [tail]
+        return names, institutions
+
+    def _split_address_entry(self, entry: str) -> tuple[list[str], list[str]]:
+        """Keep a personal name in front of an address, else keep it as text."""
+
+        head, separator, tail = entry.partition(",")
+        head, tail = head.strip(" ,;"), tail.strip(" ,;")
+        if separator and head and tail and self._looks_like_person(head):
+            return [head], [tail]
+        return [], [entry]
+
+    @staticmethod
+    def _looks_like_person(text: str) -> bool:
+        """True when text could plausibly be a personal name.
+
+        Institution words are rejected outright so "Headache Center" or
+        "Medical Center" never becomes an author when their line is treated
+        as an address tail.
+        """
+
+        if not text or _INSTITUTION_WORDS.search(text):
+            return False
+        return True
+
 
     # ------------------------------------------------------------------
     # Marker handling
@@ -311,6 +438,65 @@ class AuthorLinker:
     # ------------------------------------------------------------------
     # Affiliation segmentation
     # ------------------------------------------------------------------
+
+    def _add_embedded_affiliation(
+        self, affiliations: list[Affiliation], text: str, known_markers: set[str]
+    ) -> Affiliation:
+        """Add one institution lifted out of an author line.
+
+        Unlike an affiliation block, an embedded institution never folds into
+        the entry above it: that fold merged two authors' institutions into a
+        single affiliation. When the PDF already prints the same institution
+        on its own, that entry is reused instead of duplicated.
+        """
+
+        cleaned = " ".join(str(text or "").split())
+        marker, raw_marker, body = self._split_affiliation_label(cleaned, known_markers)
+        entry_text = body or cleaned
+        key = self._affiliation_key(entry_text)
+        if key:
+            for existing in affiliations:
+                if self._affiliation_matches(existing, key):
+                    if marker and marker not in existing.markers:
+                        existing.markers.append(marker)
+                    if marker and not existing.marker:
+                        existing.marker = marker
+                        existing.raw_marker = raw_marker
+                    return existing
+        affiliation = Affiliation(
+            id=self._next_affiliation_id(affiliations),
+            text=entry_text,
+            marker=marker,
+            raw_marker=raw_marker,
+            markers=[marker] if marker else [],
+        )
+        affiliations.append(affiliation)
+        return affiliation
+
+    def _affiliation_matches(self, affiliation: Affiliation, key: str) -> bool:
+        """True when an already built affiliation covers this key.
+
+        The same institution prints in two lengths: the author line says
+        "Boston University" while its block says "Boston University, Chestnut
+        Hill, USA". Either direction of the prefix counts as a match, but a
+        key this short cannot be trusted for prefixing.
+        """
+
+        existing = self._affiliation_key(affiliation.text)
+        if existing == key:
+            return True
+        shorter, longer = sorted((existing, key), key=len)
+        return len(shorter) >= 3 and longer.startswith(shorter)
+
+    @staticmethod
+    def _next_affiliation_id(affiliations: list[Affiliation]) -> str:
+        """Return an unused ``aff_N`` id; numbering may have skipped values."""
+
+        used = {affiliation.id for affiliation in affiliations}
+        index = 1
+        while f"aff_{index}" in used:
+            index += 1
+        return f"aff_{index}"
 
     def _build_affiliations(self, texts: list[str], known_markers: set[str] | None = None) -> list[Affiliation]:
         """Turn affiliation text blocks into deduplicated affiliations.
@@ -424,16 +610,39 @@ class AuthorLinker:
     # ------------------------------------------------------------------
 
     def _apply_matching_rules(
-        self, authors: list[Author], affiliations: list[Affiliation], issues: list[LinkIssue]
+        self,
+        authors: list[Author],
+        affiliations: list[Affiliation],
+        issues: list[LinkIssue],
+        inline_ids: set[str] | None = None,
     ) -> None:
         if not affiliations:
             return
 
         if len(affiliations) == 1:
+            only = affiliations[0]
+            belongs_to_one_author = only.id in (inline_ids or set())
             for author in authors:
                 if author.affiliation_ids:
                     continue
-                author.affiliation_ids = [affiliations[0].id]
+                if belongs_to_one_author:
+                    # The institution was printed on one author's own line, so
+                    # it is that author's affiliation; the rest of the byline
+                    # simply carries none in the source ("Jennifer Warnock,
+                    # Oak Ridge National Laboratory" followed by unmarked co-
+                    # authors). Broadcasting would invent one for every name.
+                    issues.append(
+                        LinkIssue(
+                            severity="warning",
+                            message=(
+                                f"Author \"{author.display_name}\" carries no marker "
+                                "and no affiliation of its own; left unlinked rather than assumed"
+                            ),
+                            author_id=author.id,
+                        )
+                    )
+                    continue
+                author.affiliation_ids = [only.id]
                 issues.append(
                     LinkIssue(
                         severity="warning",
@@ -442,7 +651,7 @@ class AuthorLinker:
                             "because no marker could be resolved"
                         ),
                         author_id=author.id,
-                        affiliation_id=affiliations[0].id,
+                        affiliation_id=only.id,
                     )
                 )
             return
@@ -630,6 +839,9 @@ class AuthorLinker:
             return False
         if cleaned.upper() in {"ABSTRACT", "A B S T R A C T"}:
             return False
+        if _DEGREE_SUFFIX.fullmatch(cleaned):
+            # "PhD" and friends are post-nominals printed beside a name.
+            return False
         if not any(ch.isalpha() for ch in cleaned):
             return False
         if sum(1 for ch in cleaned if ch.isalpha()) < 2:
@@ -659,6 +871,7 @@ class AuthorLinker:
             "china", "india", "australia", "brazil", "netherlands", "sweden",
             "switzerland", "philadelphia", "boston", "london", "paris", "berlin",
             "new york", "new jersey", "united states", "united kingdom",
+            "los angeles", "san diego",
         }
         if lowered in place_tokens or re.fullmatch(r"[A-Z]{1,3}", cleaned):
             return False

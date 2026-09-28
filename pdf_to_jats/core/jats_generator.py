@@ -142,29 +142,6 @@ class JATSGenerator:
 
         self._append_correspondence(head, document)
 
-    def _author_groups(self, document: Document) -> list[tuple[Any, list[Any]]]:
-        """Group authors under the affiliation each of them references.
-
-        ANI expresses the author/affiliation link structurally, so every
-        ``<author-group>`` carries one affiliation plus the authors pointing at
-        it. An author with several affiliations is repeated in each of their
-        groups, and authors with none are emitted last without an affiliation so
-        they are not silently dropped.
-        """
-
-        groups: list[tuple[Any, list[Any]]] = []
-        for affiliation in document.affiliations:
-            # Unreferenced affiliations are still emitted; the linker reports
-            # them rather than letting them vanish from the output.
-            members = [
-                author for author in document.authors if affiliation.id in author.affiliation_ids
-            ]
-            groups.append((affiliation, members))
-        unassigned = [author for author in document.authors if not author.affiliation_ids]
-        if unassigned:
-            groups.append((None, unassigned))
-        return groups
-
         if document.abstract:
             abstracts = etree.SubElement(head, self._qname("abstracts"))
             abstract = etree.SubElement(abstracts, self._qname("abstract"))
@@ -204,6 +181,29 @@ class JATSGenerator:
             etree.SubElement(publicationdate, self._qname("month")).text = str(pub.get("month", "")).zfill(2)
             etree.SubElement(publicationdate, self._qname("day")).text = str(pub.get("day", "")).zfill(2)
             etree.SubElement(publicationdate, self._qname("date-text")).text = str(pub.get("date_text", ""))
+
+    def _author_groups(self, document: Document) -> list[tuple[Any, list[Any]]]:
+        """Group authors under the affiliation each of them references.
+
+        ANI expresses the author/affiliation link structurally, so every
+        ``<author-group>`` carries one affiliation plus the authors pointing at
+        it. An author with several affiliations is repeated in each of their
+        groups, and authors with none are emitted last without an affiliation so
+        they are not silently dropped.
+        """
+
+        groups: list[tuple[Any, list[Any]]] = []
+        for affiliation in document.affiliations:
+            # Unreferenced affiliations are still emitted; the linker reports
+            # them rather than letting them vanish from the output.
+            members = [
+                author for author in document.authors if affiliation.id in author.affiliation_ids
+            ]
+            groups.append((affiliation, members))
+        unassigned = [author for author in document.authors if not author.affiliation_ids]
+        if unassigned:
+            groups.append((None, unassigned))
+        return groups
 
     def _append_affiliation_text(self, parent: Any, text: str) -> None:
         organization, city, country = self._split_affiliation(text)

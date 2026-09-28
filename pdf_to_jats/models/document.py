@@ -13,7 +13,9 @@ from pdf_to_jats.models.block import TextBlock, reading_order_key
 from pdf_to_jats.models.paragraph import Paragraph
 
 
-REFINE_ROLES = frozenset({"title", "author", "corresponding_author", "affiliation", "abstract"})
+REFINE_ROLES = frozenset(
+    {"title", "author", "corresponding_author", "affiliation", "abstract", "abstract_number", "keywords"}
+)
 
 
 def block_matches_segment(block: TextBlock, segment: dict[str, Any] | None) -> bool:

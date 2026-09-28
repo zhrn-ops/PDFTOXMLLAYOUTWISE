@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
 )
 
 from pdf_to_jats.core.author_linker import AuthorLinker
-from pdf_to_jats.core.auto_refiner import AutoRefiner, is_abstract_heading
+from pdf_to_jats.core.auto_refiner import AutoRefiner, abstract_number_marker, is_abstract_heading
 from pdf_to_jats.core.jats_generator import JATSGenerator
 from pdf_to_jats.core.pdf_extractor import PDFExtractor
 from pdf_to_jats.core.paragraph_reconstructor import ParagraphReconstructor
@@ -651,6 +651,12 @@ class MainWindow(QMainWindow):
             metadata.update(
                 {
                     "preview_source_block_ids": source_ids,
+                    # A preview continuation is virtual, so its own page and
+                    # column come from only its first block.  Preserve every
+                    # contributing ID as merge provenance as well: the
+                    # per-article exporter uses it to keep this block with the
+                    # article that owns any of its source text.
+                    "merged_block_ids": source_ids,
                     "source_line_ids": list(dict.fromkeys(source_line_ids)),
                     "is_paragraph_unit": True,
                     "merge_source": "html_preview_continuation",
@@ -992,6 +998,24 @@ class MainWindow(QMainWindow):
             return
         output_dir = self.config.generated_xml_dir
         output_dir.mkdir(parents=True, exist_ok=True)
+        # A full document can validate while this detected article is missing
+        # content. Validate the segment before writing or locking it.
+        self._update_document_model()
+        export_document = self._document_with_html_preview_continuations()
+        segment_document = self._document_for_segment(segment, export_document)
+        validation_errors = self.validator.validate_document(segment_document)
+        if validation_errors:
+            messages = "\n".join(f"• {error.message}" for error in validation_errors)
+            self._log(
+                f"Cannot finish article {segment.get('abstract_number', '')}: "
+                f"{'; '.join(error.message for error in validation_errors)}"
+            )
+            QMessageBox.warning(
+                self,
+                "Article needs review",
+                "The article was not exported or locked because it is incomplete:\n\n" + messages,
+            )
+            return
         try:
             generated_path = self._export_segment_document(segment, output_dir)
         except Exception as exc:
@@ -1345,6 +1369,12 @@ class MainWindow(QMainWindow):
         if self.document is None:
             return
         excluded_ids = set(self.document.metadata.get("abstract_number_block_ids", []))
+        # A block tagged abstract_number is a marker as well: exclude it from
+        # the title, abstract, and body just like an extractor-found one.
+        role_marker_ids = {block.id for block in self.document.blocks if block.role == "abstract_number"}
+        if role_marker_ids - excluded_ids:
+            excluded_ids |= role_marker_ids
+            self.document.metadata["abstract_number_block_ids"] = sorted(excluded_ids)
         blocks = [
             block
             for block in self.document.blocks
@@ -1397,16 +1427,32 @@ class MainWindow(QMainWindow):
             raise RuntimeError("Load a PDF first.")
         start_page = int(segment.get("start_page", 1))
         end_page = int(segment.get("end_page", start_page))
+        source_by_id = {
+            block.id: block
+            for block in [*(source.raw_blocks or []), *source.blocks]
+        }
+
+        def belongs_to_segment(block) -> bool:
+            """Include a merged block when any of its source lines belongs here."""
+
+            if block_matches_segment(block, segment):
+                return True
+            return any(
+                source_block is not None and block_matches_segment(source_block, segment)
+                for source_id in (block.metadata or {}).get("merged_block_ids", [])
+                if (source_block := source_by_id.get(str(source_id))) is not None
+            )
+
         blocks = [
             replace(block, metadata=dict(block.metadata))
             for block in source.blocks
-            if block_matches_segment(block, segment)
+            if belongs_to_segment(block)
         ]
         block_ids = {block.id for block in blocks}
         raw_blocks = [
             replace(block, metadata=dict(block.metadata))
             for block in (source.raw_blocks or source.blocks)
-            if block_matches_segment(block, segment)
+            if belongs_to_segment(block)
         ]
         paragraphs = [
             replace(
@@ -1483,7 +1529,14 @@ class MainWindow(QMainWindow):
 
         if self.document is None:
             return
-        source_lines = self.document.raw_blocks or self.document.blocks
+        excluded_ids = set(self.document.metadata.get("abstract_number_block_ids", []))
+        source_lines = [
+            block
+            for block in (self.document.raw_blocks or self.document.blocks)
+            # Marker lines are identifiers, never prose: drop them so they
+            # cannot be auto-accepted into an exported body paragraph.
+            if block.id not in excluded_ids
+        ]
         proposals = self.paragraph_reconstructor.propose(source_lines)
         accepted = self.paragraph_reconstructor.accepted_from_blocks(self.document.blocks)
         # Manual merge units win; skip auto-accepting proposals that overlap them.
@@ -1564,6 +1617,8 @@ class MainWindow(QMainWindow):
             "Corresponding Author": [],
             "Affiliations": [],
             "Abstract": [],
+            "Abstract Number": [],
+            "Keywords": [],
         }
         for block in self.document.blocks:
             if block.role == "title":
@@ -1576,6 +1631,10 @@ class MainWindow(QMainWindow):
                 buckets["Affiliations"].append(block)
             elif block.role == "abstract":
                 buckets["Abstract"].append(block)
+            elif block.role == "abstract_number":
+                buckets["Abstract Number"].append(block)
+            elif block.role == "keywords":
+                buckets["Keywords"].append(block)
         for label, category_blocks in buckets.items():
             parent = self.tree.category_item(label)
             if parent is None:
@@ -1701,7 +1760,15 @@ class MainWindow(QMainWindow):
                 "This block belongs to a finished article and is locked. Use Reopen Article to unlock it first.",
             )
             return
-        valid_roles = {"title", "author", "corresponding_author", "affiliation", "abstract"}
+        valid_roles = {
+            "title",
+            "author",
+            "corresponding_author",
+            "affiliation",
+            "abstract",
+            "abstract_number",
+            "keywords",
+        }
         new_role = item.text(1).strip().lower()
         if new_role in valid_roles:
             if new_role == "title":
@@ -1710,7 +1777,9 @@ class MainWindow(QMainWindow):
                     for other in self.document.blocks:
                         if other.id != block_id and other.role == "title":
                             other.role = "unclassified"
+            previous_role = block.role
             block.role = new_role
+            self._sync_block_abstract_number_role(block, previous_role)
             self._update_document_model()
             self.viewer.set_blocks([asdict(b) for b in self.document.blocks])
             self.viewer.set_zones([asdict(zone) for zone in self.document.zones])
@@ -1904,13 +1973,25 @@ class MainWindow(QMainWindow):
         skipped_locked = 0
         for block_id, role, confidence in assignments:
             block = by_id.get(block_id)
-            if block is None or role not in {"title", "author", "affiliation", "abstract", "unclassified"}:
+            if block is None or role not in {
+                "title",
+                "author",
+                "affiliation",
+                "abstract",
+                "abstract_number",
+                "keywords",
+                "unclassified",
+            }:
                 continue
             if self._article_locked(block):
                 skipped_locked += 1
                 continue
             block.role = role
             block.confidence = confidence
+            if role == "abstract_number":
+                # Only a person can untag a marker: if this model turns out to
+                # be wrong, the exclusion stays until the user says otherwise.
+                self._apply_abstract_number_role(block)
             changed.append((block.id, role))
             if block.id in selected_zone_block_ids:
                 for zone in (zone for zone in self.document.zones if zone.id in self._selected_zone_ids):
@@ -2060,6 +2141,12 @@ class MainWindow(QMainWindow):
         ]
         if marker_ids:
             self.document.metadata["abstract_number_block_ids"] = marker_ids
+            for marker_id in marker_ids:
+                marker_block = blocks_by_id.get(marker_id)
+                if marker_block is not None and marker_block.role != "abstract_number":
+                    marker_block.role = "abstract_number"
+                    marker_block.confidence = 1.0
+                    marker_block.metadata["role_source"] = "model"
         target: dict[str, object] | None = None
         for segment in self._document_segments():
             if any(
@@ -2106,6 +2193,97 @@ class MainWindow(QMainWindow):
         self._finished_segment_keys = [
             new_key if key == old_key else key for key in self._finished_segment_keys
         ]
+
+    def _apply_abstract_number_role(self, block) -> None:
+        """Record a block tagged ``abstract_number`` as the article marker.
+
+        The block is excluded from the title, abstract, and body, and a marker
+        that prints a bare identifier also becomes the exported Abstract No.
+        """
+
+        if self.document is None:
+            return
+        marker_ids = [
+            str(value)
+            for value in self.document.metadata.get("abstract_number_block_ids", [])
+            if str(value)
+        ]
+        if block.id not in marker_ids:
+            marker_ids.append(block.id)
+            self.document.metadata["abstract_number_block_ids"] = marker_ids
+        value = abstract_number_marker(block.text)
+        if not value:
+            return
+        target = next(
+            (
+                segment
+                for segment in self._document_segments()
+                if block_matches_segment(block, segment)
+            ),
+            None,
+        )
+        if target is None:
+            current = self._current_segment()
+            target = current[0] if current else None
+        self._set_abstract_number(value, target)
+        if target is not None:
+            target["abstract_number_block_id"] = block.id
+
+    def _clear_abstract_number_role(self, block_id: str) -> None:
+        """Undo the marker metadata after a person untags a block."""
+
+        if self.document is None:
+            return
+        marker_ids = [
+            str(value)
+            for value in self.document.metadata.get("abstract_number_block_ids", [])
+            if str(value) and str(value) != block_id
+        ]
+        self.document.metadata["abstract_number_block_ids"] = marker_ids
+        for segment in self._document_segments():
+            if str(segment.get("abstract_number_block_id", "")) == block_id:
+                segment.pop("abstract_number_block_id", None)
+
+    def _sync_block_abstract_number_role(self, block, previous_role: str) -> None:
+        """Apply or undo marker metadata after a manual role change."""
+
+        if block.role == "abstract_number":
+            self._apply_abstract_number_role(block)
+        elif previous_role == "abstract_number":
+            self._clear_abstract_number_role(block.id)
+
+    def _sync_abstract_number_from_roles(self) -> str:
+        """Adopt the Abstract No from a tagged marker when extraction missed it.
+
+        A bare marker such as ``(S100)`` is now tagged by the classifier even
+        though the extractor only matches it when more text follows the closing
+        parenthesis, so without this the identifier would stay at the default
+        ABSN. Runs once after load, so clearing the field later still sticks.
+        """
+
+        if self.document is None:
+            return ""
+        if self._normalize_abstract_number(self.document.metadata.get("abstract_number", "")):
+            return ""
+        for block in self.document.blocks:
+            if block.role != "abstract_number":
+                continue
+            value = abstract_number_marker(block.text)
+            if not value:
+                continue
+            target = next(
+                (
+                    segment
+                    for segment in self._document_segments()
+                    if block_matches_segment(block, segment)
+                ),
+                None,
+            )
+            self._set_abstract_number(value, target)
+            if target is not None:
+                target["abstract_number_block_id"] = block.id
+            return value
+        return ""
 
     @staticmethod
     def _normalize_abstract_number(value: object) -> str:
@@ -2284,7 +2462,7 @@ class MainWindow(QMainWindow):
             return True
         if re.match(r"^(doi:|https?://|www\.)", lower):
             return True
-        return bool(block.role in {"title", "author", "corresponding_author", "affiliation"})
+        return bool(block.role in {"title", "author", "corresponding_author", "affiliation", "abstract_number"})
 
     def _looks_like_page_continuation(self, first, second) -> bool:
         """Accept an explicitly selected continuation across consecutive pages."""
@@ -2839,6 +3017,7 @@ class MainWindow(QMainWindow):
                 f"Auto-refined {refine_report.changed_count} block role(s); "
                 f"{refine_report.review_count} need review."
             )
+        self._sync_abstract_number_from_roles()
         self._update_document_model()
         self._log_link_issues()
         self.viewer.load_pdf(path)
@@ -3025,7 +3204,9 @@ class MainWindow(QMainWindow):
             if zone.source == "auto":
                 zone.source = "user"
             for block in self._blocks_for_zone(zone):
+                previous_role = block.role
                 block.role = new_role
+                self._sync_block_abstract_number_role(block, previous_role)
                 if new_role == "title":
                     self.document.metadata["manual_title_block_id"] = block.id
                     for other in self.document.blocks:
@@ -3063,7 +3244,9 @@ class MainWindow(QMainWindow):
         if block.role == new_role:
             return
 
+        previous_role = block.role
         block.role = new_role
+        self._sync_block_abstract_number_role(block, previous_role)
         if new_role == "title":
             self.document.metadata["manual_title_block_id"] = block_id
             for other in self.document.blocks:

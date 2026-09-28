@@ -19,6 +19,8 @@ ROLE_OPTIONS = [
     "corresponding_author",
     "affiliation",
     "abstract",
+    "abstract_number",
+    "keywords",
 ]
 
 
@@ -59,7 +61,7 @@ class StructureTree(QTreeWidget):
         header.setStretchLastSection(True)
         self.setItemDelegateForColumn(1, RoleDelegate(self))
         self.categories: dict[str, QTreeWidgetItem] = {}
-        for label in ["Title", "Authors", "Corresponding Author", "Affiliations", "Abstract"]:
+        for label in ["Title", "Authors", "Corresponding Author", "Affiliations", "Abstract", "Abstract Number", "Keywords"]:
             item = QTreeWidgetItem([label, ""])
             item.setFlags(item.flags() | Qt.ItemIsDragEnabled | Qt.ItemIsDropEnabled)
             self.addTopLevelItem(item)

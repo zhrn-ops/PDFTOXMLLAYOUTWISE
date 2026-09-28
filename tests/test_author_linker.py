@@ -163,3 +163,131 @@ def test_no_markers_with_several_authors_is_not_assumed():
 
     assert [author.affiliation_ids for author in linked.authors] == [[], []]
     assert len([issue for issue in linked.issues if issue.severity == "warning"]) >= 2
+
+
+def test_two_authors_with_inline_institutions_stay_separate():
+    """Each author's own institution must not fold into the other's.
+
+    The wrap-fold used to merge both institutions into one affiliation that
+    every author then pointed at.
+    """
+
+    linked = AuthorLinker().link_from_texts(
+        ["J. Smith, Boston University", "A. Lee, Massachusetts Institute of Technology"],
+        [],
+    )
+
+    assert [author.display_name for author in linked.authors] == ["J. Smith", "A. Lee"]
+    assert [aff.text for aff in linked.affiliations] == [
+        "Boston University",
+        "Massachusetts Institute of Technology",
+    ]
+    # The institution sharing an author's line is that author's affiliation,
+    # so no marker is needed and nothing is left to flag.
+    assert [author.affiliation_ids for author in linked.authors] == [["aff_1"], ["aff_2"]]
+    assert linked.issues == []
+
+
+def test_semicolon_entries_keep_the_second_author_and_its_institution():
+    """"J. Smith, Boston University; A. Lee, MIT" used to lose A. Lee."""
+
+    linked = AuthorLinker().link_from_texts(
+        ["J. Smith, Boston University; A. Lee, MIT"], []
+    )
+
+    assert [author.display_name for author in linked.authors] == ["J. Smith", "A. Lee"]
+    assert [aff.text for aff in linked.affiliations] == ["Boston University", "MIT"]
+    assert [author.affiliation_ids for author in linked.authors] == [["aff_1"], ["aff_2"]]
+
+
+def test_inline_institution_reuses_the_printed_affiliation():
+    """The same institution on the line and in a block is one entry."""
+
+    linked = AuthorLinker().link_from_texts(
+        ["J. Smith, Boston University"], ["Boston University, Chestnut Hill, USA"]
+    )
+
+    assert [aff.text for aff in linked.affiliations] == ["Boston University, Chestnut Hill, USA"]
+    assert linked.authors[0].affiliation_ids == [linked.affiliations[0].id]
+    assert linked.issues == []
+
+
+def test_address_tail_keeps_the_author_name():
+    """No institution keyword on the line, yet the person must survive."""
+
+    linked = AuthorLinker().link_from_texts(["Jane Doe, Philadelphia, PA, USA"], [])
+
+    assert [author.display_name for author in linked.authors] == ["Jane Doe"]
+    assert [aff.text for aff in linked.affiliations] == ["Philadelphia, PA, USA"]
+    assert linked.authors[0].affiliation_ids == [linked.affiliations[0].id]
+
+
+def test_inline_marker_still_wins_over_the_embedded_institution():
+    """A printed marker points at the printed block, not a shorter duplicate."""
+
+    linked = AuthorLinker().link_from_texts(
+        ["J. Smith1, Boston University", "A. Lee2, MIT"],
+        ["1 Boston University, USA", "2 MIT, USA"],
+    )
+
+    assert [aff.id for aff in linked.affiliations] == ["1", "2"]
+    assert [author.affiliation_ids for author in linked.authors] == [["1"], ["2"]]
+    assert linked.issues == []
+
+
+def test_inline_affiliation_is_not_broadcast_to_the_rest_of_the_byline():
+    """Only the author on the institution's line carries it.
+
+    "Jennifer Warnock, Oak Ridge National Laboratory" followed by eight
+    unmarked co-authors: the CAR single-affiliation rule used to hand Oak
+    Ridge to every name in the byline.
+    """
+
+    linked = AuthorLinker().link_from_texts(
+        [
+            "Jennifer Warnock, Oak Ridge National Laboratory",
+            "Sharique Khan, Wellington Leite, Qiu Zhang, Gregory Hura",
+        ],
+        [],
+    )
+
+    by_name = {author.display_name: author.affiliation_ids for author in linked.authors}
+    assert len(by_name) == 5
+    assert by_name["Jennifer Warnock"] == ["aff_1"]
+    assert by_name["Sharique Khan"] == []
+    assert by_name["Gregory Hura"] == []
+    assert [aff.text for aff in linked.affiliations] == ["Oak Ridge National Laboratory"]
+    # The unmarked co-authors are reported rather than quietly given an
+    # institution the source never printed for them.
+    assert len([issue for issue in linked.issues if issue.severity == "warning"]) == 4
+
+
+def test_wrapped_byline_rows_split_on_line_breaks():
+    """A row break inside one block must not merge names into the institution."""
+
+    linked = AuthorLinker().link_from_texts(
+        [
+            "Jennifer Warnock, Oak Ridge National Laboratory\n"
+            "Sharique Khan, Qiu Zhang"
+        ],
+        [],
+    )
+
+    assert [author.display_name for author in linked.authors] == [
+        "Jennifer Warnock",
+        "Sharique Khan",
+        "Qiu Zhang",
+    ]
+    assert linked.authors[0].affiliation_ids == ["aff_1"]
+    assert linked.authors[1].affiliation_ids == []
+    assert [aff.text for aff in linked.affiliations] == ["Oak Ridge National Laboratory"]
+
+
+def test_printed_single_affiliation_is_still_shared_by_every_author():
+    """A block-printed affiliation keeps the CAR behaviour: it fits them all."""
+
+    linked = AuthorLinker().link_from_texts(
+        ["Jennifer Warnock", "Sharique Khan"], ["Oak Ridge National Laboratory"]
+    )
+
+    assert [author.affiliation_ids for author in linked.authors] == [["aff_1"], ["aff_1"]]

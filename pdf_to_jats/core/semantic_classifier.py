@@ -8,6 +8,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from pdf_to_jats.core.auto_refiner import abstract_number_marker
 from pdf_to_jats.core.layout_analyzer import LayoutAnalyzer
 from pdf_to_jats.models.block import TextBlock
 from pdf_to_jats.llm.prompts import CLASSIFICATION_PROMPT
@@ -53,10 +54,20 @@ class SemanticClassifier:
         text = block.text.strip()
         lower = text.lower()
         words = [part for part in re.split(r"\s+", text) if part]
+        # Checked before footer noise so a marker sitting low on the page is
+        # not mistaken for a footer line; bare digits never match, so page
+        # numbers still fall through to the noise rule below.
+        marker = abstract_number_marker(text)
+        if marker:
+            return ClassificationResult(
+                "abstract_number", 1.0, rationale=f"abstract-number marker {marker}"
+            )
         if self._looks_like_footer_noise(block, lower, words):
             return ClassificationResult("unclassified", 0.0, rationale="footer/noise")
         if re.search(r"\b(?:presenting|corresponding)\s+author\b", lower):
             return ClassificationResult("corresponding_author", 1.0, rationale="corresponding-author marker")
+        if re.match(r"^key\s*words?\s*[:\-]", text, re.IGNORECASE):
+            return ClassificationResult("keywords", 1.0, rationale="keywords label")
         scores = {
             "title": 0,
             "author": 0,

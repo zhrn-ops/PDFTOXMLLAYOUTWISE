@@ -1,5 +1,5 @@
 
-from pdf_to_jats.core.auto_refiner import AutoRefiner, is_abstract_heading
+from pdf_to_jats.core.auto_refiner import AutoRefiner, abstract_number_marker, is_abstract_heading
 from pdf_to_jats.models.block import TextBlock
 
 
@@ -38,11 +38,11 @@ def test_doi_line_is_not_title():
     assert block.role == "unclassified"
 
 
-def test_keywords_line_is_not_title():
+def test_keywords_line_is_classified_as_keywords():
     block = _block("Keywords: peptides, protein structure, antimicrobial", role="title")
     AutoRefiner().refine([block])
 
-    assert block.role == "unclassified"
+    assert block.role == "keywords"
 
 
 def test_author_institution_line_is_reassigned_to_author():
@@ -115,3 +115,37 @@ def test_changed_metadata_records_previous_role():
 
     assert block.metadata["role_source"] == "auto_refine"
     assert block.metadata["role_before_refine"] == "title"
+
+
+def test_marker_block_is_reclassified_as_abstract_number():
+    block = _block("(S100)", role="title")
+    AutoRefiner().refine([block])
+
+    assert block.role == "abstract_number"
+
+
+def test_labelled_marker_is_not_abstract_text():
+    block = _block("Abstract No: 4349", role="abstract")
+    AutoRefiner().refine([block])
+
+    assert block.role == "abstract_number"
+
+
+def test_unclassified_marker_is_promoted():
+    block = _block("ABSN 4349", role="unclassified")
+    AutoRefiner().refine([block])
+
+    assert block.role == "abstract_number"
+
+
+def test_abstract_number_marker_needs_a_label_or_parentheses():
+    assert abstract_number_marker("Abstract No: 4349") == "4349"
+    assert abstract_number_marker("abstract no. S120") == "S120"
+    assert abstract_number_marker("(S100)") == "S100"
+    # A bare token is ambiguous with a page number, and a marker inside a
+    # longer line belongs to the title or body text around it.
+    assert abstract_number_marker("4349") == ""
+    assert abstract_number_marker("A Review of Treatment Options (2024)") == ""
+    assert abstract_number_marker("(POM) VS DARA PLUS POM AND DEXAMETHASONE (DPD)") == ""
+    assert abstract_number_marker("(Ichilov) Medical Center, Tel Aviv, Israel") == ""
+    assert abstract_number_marker("mMCP1 | enzyme expression in tissue") == ""
