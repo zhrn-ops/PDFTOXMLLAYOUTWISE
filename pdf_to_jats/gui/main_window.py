@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -60,8 +61,15 @@ from pdf_to_jats.models.document import (
     DocumentZone,
     REFINE_ROLES,
     block_matches_segment,
+    segment_is_manual,
 )
 from pdf_to_jats.models.paragraph import Paragraph
+from pdf_to_jats.models.segmentation import (
+    SOURCE_MANUAL,
+    ArticleBoundary,
+    Segmentation,
+    legacy_segment_boundaries,
+)
 from pdf_to_jats.utils.config import load_config, save_openrouter_settings
 
 
@@ -98,8 +106,11 @@ class MainWindow(QMainWindow):
         self._last_refine_report = None
         self._review_block_ids: list[str] = []
         self._review_index = -1
-        self._finished_segment_keys: list[tuple] = []
-        self._current_segment_key: tuple | None = None
+        self._finished_segment_keys: list[str] = []
+        self._current_segment_key: str | None = None
+        # Cached article identities, held together with the block and segment
+        # lists they were computed from so a replaced list invalidates them.
+        self._segment_identity_cache: tuple | None = None
         self.setWindowTitle(self.config.app_name)
         self.setMinimumSize(720, 520)
         self.setStyleSheet(APP_STYLE)
@@ -253,9 +264,12 @@ class MainWindow(QMainWindow):
         self.actions_layout = actions
         self.tree.itemSelectionChanged.connect(self._on_tree_selection_changed)
         self.tree.itemChanged.connect(self._on_tree_item_changed)
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._show_tree_article_menu)
         self.viewer.label.blockSelected.connect(self._on_viewer_block_selected)
         self.viewer.label.blockRangeSelected.connect(self._on_viewer_block_range_selected)
         self.viewer.label.blocksRectSelected.connect(self._on_viewer_blocks_rect_selected)
+        self.viewer.label.blockContextRequested.connect(self._show_block_article_menu)
         self.viewer.label.zoneSelected.connect(self._on_viewer_zone_selected)
         self.viewer.label.zoneMoved.connect(self._on_viewer_zone_moved)
         self.viewer.label.zoneCreated.connect(self._on_viewer_zone_created)
@@ -264,6 +278,16 @@ class MainWindow(QMainWindow):
         self.undo_shortcut.activated.connect(self.undo_last_action)
         self.continuation_preview_shortcut = QShortcut(QKeySequence(Qt.Key_Space), self)
         self.continuation_preview_shortcut.activated.connect(self.show_selected_continuation_arrow)
+        # Splitting is the most repeated action in a multi-article PDF, so it is
+        # reachable from the keyboard as well as by button and right-click.
+        self.split_shortcut = QShortcut(QKeySequence("Ctrl+Shift+N"), self)
+        self.split_shortcut.activated.connect(self.split_article_at_selection)
+        # Processing a PDF of several articles is mostly a sequence of articles,
+        # so stepping to the next one should not require aiming at a tab.
+        self.next_article_shortcut = QShortcut(QKeySequence("Alt+Right"), self)
+        self.next_article_shortcut.activated.connect(lambda: self.select_adjacent_article(1))
+        self.previous_article_shortcut = QShortcut(QKeySequence("Alt+Left"), self)
+        self.previous_article_shortcut.activated.connect(lambda: self.select_adjacent_article(-1))
         viewer_column = QWidget()
         viewer_layout = QVBoxLayout(viewer_column)
         viewer_layout.setContentsMargins(0, 0, 0, 0)
@@ -281,14 +305,35 @@ class MainWindow(QMainWindow):
         self.articles_tabs.tabBarClicked.connect(self._on_article_tab_clicked)
         self.articles_tabs.setContextMenuPolicy(Qt.CustomContextMenu)
         self.articles_tabs.customContextMenuRequested.connect(self._show_article_tab_menu)
+        self.articles_tabs.setToolTip(
+            "Alt+Left / Alt+Right steps through the detected articles."
+        )
+        self.split_segment_btn = QPushButton("Split Article Here")
+        self.split_segment_btn.setToolTip(
+            "Start a new article at the selected block (Ctrl+Shift+N). Right-clicking\n"
+            "a line in the page does the same thing without selecting it first."
+        )
+        self.split_segment_btn.setEnabled(False)
+        self.split_segment_btn.clicked.connect(self.split_article_at_selection)
+        # Folding an article back into its neighbour is the usual repair after a
+        # wrong split, so it gets its own button instead of the picker dialog.
+        self.merge_previous_btn = QPushButton("Merge Into Previous")
+        self.merge_previous_btn.setToolTip(
+            "Fold the current article into the one before it, undoing a split that\n"
+            "cut an article in two. Ctrl+Z also undoes a split or merge."
+        )
+        self.merge_previous_btn.setEnabled(False)
+        self.merge_previous_btn.clicked.connect(lambda: self.merge_article_with_previous())
         self.merge_segments_btn = QPushButton("Merge Current With...")
         self.merge_segments_btn.setToolTip(
-            "Combine the current article with another one that was split by mistake."
+            "Combine the current article with any others that were split by mistake."
         )
         self.merge_segments_btn.setEnabled(False)
         self.merge_segments_btn.clicked.connect(self.merge_selected_segments)
         articles_layout.addWidget(self.articles_hint)
         articles_layout.addWidget(self.articles_tabs, 1)
+        articles_layout.addWidget(self.split_segment_btn)
+        articles_layout.addWidget(self.merge_previous_btn)
         articles_layout.addWidget(self.merge_segments_btn)
 
         selected_column = QWidget()
@@ -595,7 +640,7 @@ class MainWindow(QMainWindow):
         output_dir.mkdir(parents=True, exist_ok=True)
         output_paths: list[Path] = []
         for index, segment_document in enumerate(documents, start=1):
-            filename = "article.xml" if len(documents) == 1 else f"article_{index:03d}.xml"
+            filename = self._article_filename(segment_document, index, len(documents))
             output_path = output_dir / filename
             generated_path = self.generator.generate(segment_document, output_path)
             output_paths.append(generated_path)
@@ -729,7 +774,10 @@ class MainWindow(QMainWindow):
         )
 
     def _log(self, message: str) -> None:
-        self.log.append(message)
+        log = getattr(self, "log", None)
+        if log is None:
+            return
+        log.append(message)
 
     def _update_html_preview(self) -> None:
         """Render blocks in backend reading order as selectable HTML."""
@@ -838,23 +886,67 @@ class MainWindow(QMainWindow):
         return [segment for segment in segments if isinstance(segment, dict)]
 
     @staticmethod
-    def _segment_key(segment: dict[str, object] | None) -> tuple | None:
-        """Stable identity for a segment that survives block re-creation."""
+    def _segment_locator(segment: dict[str, object]) -> tuple:
+        """Value fingerprint used to recognize a segment dict across copies.
 
-        if not segment:
-            return None
+        The export document shallow-copies metadata, so its article segments are
+        usually the same objects. A caller that hands over an equal dict instead
+        is matched back to the stored segment through these fields.
+        """
+
+        start_order = segment.get("start_order")
         return (
             int(segment.get("index", 0)),
             str(segment.get("abstract_number", "")),
             int(segment.get("start_page", 0)),
             int(segment.get("end_page", 0)),
             tuple(int(column) for column in segment.get("columns") or []),
+            int(start_order) if start_order is not None else -1,
         )
 
-    def _segments_with_keys(self) -> list[tuple[dict[str, object], tuple]]:
+    def _invalidate_segment_identity(self) -> None:
+        """Forget cached article identities after the blocks or segments change."""
+
+        self._segment_identity_cache = None
+
+    def _segment_boundary_ids(self) -> list[str | None]:
+        """Identity per detected article: the id of the block that starts it.
+
+        An article's index, page range and columns all change when another
+        article is inserted before or merged into it, so bookkeeping keyed on
+        those fields has to be renumbered after every edit. The block an article
+        starts at does not move, which is why it is the identity here. The ids
+        come from the boundary model, whose reading stream makes "which article
+        owns this block" one lookup instead of a scan.
+        """
+
+        segments = self._document_segments()
+        if self.document is None or not segments:
+            return [None] * len(segments)
+        stored = self.document.metadata.get("article_segments")
+        cached = self._segment_identity_cache
+        if cached is not None and cached[0] is self.document.blocks and cached[1] is stored:
+            return cached[2]
+        identities = legacy_segment_boundaries(self.document.blocks, segments)
+        self._segment_identity_cache = (self.document.blocks, stored, identities)
+        return identities
+
+    def _segment_key(self, segment: dict[str, object] | None) -> str | None:
+        """Identity of one segment: the block that starts its article."""
+
+        if not segment:
+            return None
+        identities = self._segment_boundary_ids()
+        locator = self._segment_locator(segment)
+        for index, candidate in enumerate(self._document_segments()):
+            if candidate is segment or self._segment_locator(candidate) == locator:
+                return identities[index] if index < len(identities) else None
+        return None
+
+    def _segments_with_keys(self) -> list[tuple[dict[str, object], str | None]]:
         return [(segment, self._segment_key(segment)) for segment in self._document_segments()]
 
-    def _current_segment(self) -> tuple[dict[str, object], tuple] | None:
+    def _current_segment(self) -> tuple[dict[str, object], str | None] | None:
         """Return the segment the user is currently working on, if any."""
 
         if self._current_segment_key is not None:
@@ -867,6 +959,171 @@ class MainWindow(QMainWindow):
             if key not in self._finished_segment_keys:
                 return segment, key
         return None
+
+    def _notify(self, message: str) -> None:
+        """Report an outcome without interrupting: log it, echo it in the status bar.
+
+        Working through several articles means many small decisions, and a modal
+        box for each of them would have to be dismissed before the next one.
+        """
+
+        self._log(message)
+        try:
+            self.statusBar().showMessage(message, 8000)
+        except (AttributeError, RuntimeError):
+            # A window assembled without Qt (tests) has no status bar.
+            pass
+
+    def _refresh_after_article_change(self) -> None:
+        """Re-render every view that mirrors article state and block locking."""
+
+        if self.document is None:
+            return
+        self._update_document_model()
+        self.viewer.set_blocks([asdict(block) for block in self.document.blocks])
+        self.viewer.set_zones([asdict(zone) for zone in self.document.zones])
+        self._populate_tree()
+        self._update_html_preview()
+        self._update_selection_panel()
+        self._refresh_article_buttons()
+
+    def _article_segmentation(self, ordered=None) -> Segmentation | None:
+        """Return the current articles as boundaries over the reading stream.
+
+        Edits are expressed on this model rather than on page/column ranges, so
+        a cut inside one page and column is exact and every block ends up owned
+        by exactly one article.
+        """
+
+        if self.document is None:
+            return None
+        stream = list(ordered) if ordered is not None else self._ensure_reading_orders()
+        return Segmentation.from_legacy_segments(
+            stream,
+            self._document_segments(),
+            number=self._normalize_abstract_number(self.document.abstract_number()),
+        )
+
+    def _boundary_block_ids(self) -> list[str]:
+        """Ids of the blocks that start an article, in reading order."""
+
+        return [block_id for block_id in self._segment_boundary_ids() if block_id]
+
+    def select_adjacent_article(self, offset: int) -> None:
+        """Make the next or previous article the working one, and show its page."""
+
+        if self.document is None:
+            return
+        segments = self._document_segments()
+        if not segments:
+            self._notify("No article was detected in this PDF.")
+            return
+        current = self._current_segment()
+        target = self._neighbour_segment(current[0], offset) if current is not None else None
+        if target is None:
+            target = segments[0] if offset > 0 else segments[-1]
+        self._current_segment_key = self._segment_key(target)
+        self._refresh_article_buttons()
+        self.viewer.render_page(max(0, int(target.get("start_page", 1)) - 1))
+        number = str(target.get("abstract_number", "")).strip() or "ABSN"
+        self._notify(
+            f"Working on article {target.get('index', '?')} of {len(segments)} "
+            f"(ABSN {number}, page {target.get('start_page')})."
+        )
+
+    def _segment_for_key(self, key: str | None) -> dict[str, object] | None:
+        """Return the article that starts at a block, if any."""
+
+        if not key:
+            return None
+        for segment, segment_key in self._segments_with_keys():
+            if segment_key == key:
+                return segment
+        return None
+
+    def _segment_index(self, segment: dict[str, object]) -> int:
+        """Position of one article in the stored list."""
+
+        segments = self._document_segments()
+        for index, candidate in enumerate(segments):
+            if candidate is segment:
+                return index
+        locator = self._segment_locator(segment)
+        for index, candidate in enumerate(segments):
+            if self._segment_locator(candidate) == locator:
+                return index
+        return -1
+
+    def _neighbour_segment(self, segment: dict[str, object], offset: int) -> dict[str, object] | None:
+        """Return the article ``offset`` tabs away from one, if it exists."""
+
+        position = self._segment_index(segment) + offset
+        segments = self._document_segments()
+        if 0 <= position < len(segments):
+            return segments[position]
+        return None
+
+    def _neighbour_boundary_key(self, key: str | None, offset: int) -> str | None:
+        """Boundary block id of the article ``offset`` positions away from one."""
+
+        boundaries = self._boundary_block_ids()
+        if not key or key not in boundaries:
+            return None
+        position = boundaries.index(key) + offset
+        if 0 <= position < len(boundaries):
+            return boundaries[position]
+        return None
+
+    def _push_article_undo(self, label: str) -> None:
+        """Snapshot the articles so Ctrl+Z can undo a split, merge, or rename.
+
+        Splitting and merging are the two edits a person repeats while working
+        through a PDF, so both have to be reversible without reloading the file.
+        """
+
+        stack = getattr(self, "_undo_stack", None)
+        if stack is None or self.document is None:
+            return
+        stack.append(
+            {
+                "type": "article_segments",
+                "label": label,
+                "before": [dict(segment) for segment in self._document_segments()],
+                "current_key": getattr(self, "_current_segment_key", None),
+                "finished_keys": list(getattr(self, "_finished_segment_keys", [])),
+            }
+        )
+
+    def _name_articles_from_markers(self, segmentation: Segmentation, ordered) -> None:
+        """Give every unnamed article the number its first line prints, if any.
+
+        A person drawing a boundary has already decided where an article starts,
+        so the bare marker these conference PDFs print ("P-605") is read here
+        even though detection needs a label to trust it.
+        """
+
+        by_id = {block.id: block for block in ordered}
+        for position, boundary in enumerate(list(segmentation.boundaries)):
+            if str(boundary.number).strip():
+                continue
+            block = by_id.get(boundary.block_id)
+            if block is None:
+                continue
+            number = self._manual_article_number(block)
+            if not number:
+                continue
+            segmentation.boundaries[position] = ArticleBoundary(
+                block_id=boundary.block_id,
+                source=boundary.source,
+                number=number,
+                marker_block_id=block.id,
+            )
+
+    def _report_segmentation_issues(self, segmentation: Segmentation) -> None:
+        """Log what the boundary model had to correct instead of hiding it."""
+
+        for issue in segmentation.issues:
+            self._log(f"Segmentation: {issue}")
 
     def _article_locked(self, block) -> bool:
         """A block is locked when it was finished as part of an article.
@@ -902,13 +1159,7 @@ class MainWindow(QMainWindow):
             index = int(index_value) if index_value is not None else 0
         except (TypeError, ValueError):
             index = 0
-        abstract_number = str(segment.get("abstract_number", "")).strip()
-        if index > 0:
-            filename = f"article_{index:03d}.xml"
-        else:
-            filename = "article.xml"
-        if abstract_number:
-            filename = f"article_{abstract_number}.xml"
+        filename = self._article_filename(segment_document, index, 1, always_number=index > 0)
         output_path = output_dir / filename
         generated_path = self.generator.generate(segment_document, output_path)
         errors = self.validator.validate(generated_path)
@@ -919,7 +1170,24 @@ class MainWindow(QMainWindow):
             self._log(f"XML written to {generated_path}")
         return generated_path
 
-    def _lock_segment_blocks(self, segment: dict[str, object], key: tuple) -> int:
+    @staticmethod
+    def _article_filename(
+        document: Document, index: int, total: int, *, always_number: bool = False
+    ) -> str:
+        """Name an exported article after its Abstract No when it prints one.
+
+        A folder of article_P-605.xml files can be matched to the proceedings
+        entries at a glance, which article_001.xml cannot.
+        """
+
+        number = str(document.metadata.get("abstract_number", "")).strip()
+        if number and number.upper() != "ABSN":
+            return f"article_{number}.xml"
+        if total > 1 or always_number:
+            return f"article_{index:03d}.xml"
+        return "article.xml"
+
+    def _lock_segment_blocks(self, segment: dict[str, object], key: str | None) -> int:
         """Lock the worked-on fields (title, authors, affiliations, abstract).
 
         Only blocks inside the segment that carry a classified role are locked;
@@ -942,11 +1210,12 @@ class MainWindow(QMainWindow):
             block.metadata.clear()
             block.metadata.update(metadata)
             locked_count += 1
-        if key not in self._finished_segment_keys:
+        # A segment that owns no block of its own has no identity to lock.
+        if key is not None and key not in self._finished_segment_keys:
             self._finished_segment_keys.append(key)
         return locked_count
 
-    def _unlock_segment_blocks(self, segment: dict[str, object], key: tuple) -> int:
+    def _unlock_segment_blocks(self, segment: dict[str, object], key: str | None) -> int:
         """Remove the finished/locked state from a segment's blocks."""
 
         if self.document is None:
@@ -961,7 +1230,7 @@ class MainWindow(QMainWindow):
             block.metadata.clear()
             block.metadata.update(metadata)
             unlocked_count += 1
-        if key in self._finished_segment_keys:
+        if key is not None and key in self._finished_segment_keys:
             self._finished_segment_keys.remove(key)
         return unlocked_count
 
@@ -969,19 +1238,18 @@ class MainWindow(QMainWindow):
         """Export the current article's XML, then lock its fields."""
 
         if self.document is None:
-            QMessageBox.information(self, "No document", "Load a PDF first.")
+            self._notify("Load a PDF first.")
             return
         current = self._current_segment()
         if current is None:
-            QMessageBox.information(
-                self,
-                "No article",
-                "No unfinished article was detected in this PDF. Articles are identified by their abstract numbers.",
+            self._notify(
+                "No unfinished article was detected in this PDF. Articles are identified by "
+                "their abstract numbers."
             )
             return
         segment, key = current
         if key in self._finished_segment_keys:
-            QMessageBox.information(self, "Already finished", "This article is already finished.")
+            self._notify("This article is already finished.")
             return
         confirm = QMessageBox.question(
             self,
@@ -1023,57 +1291,68 @@ class MainWindow(QMainWindow):
             return
         locked_count = self._lock_segment_blocks(segment, key)
         self._current_segment_key = self._next_unfinished_segment_key()
-        self._update_document_model()
-        self.viewer.set_blocks([asdict(block) for block in self.document.blocks])
-        self.viewer.set_zones([asdict(zone) for zone in self.document.zones])
-        self._populate_tree()
-        self._update_html_preview()
-        self._update_selection_panel()
-        self._refresh_article_buttons()
-        self._log(
-            f"Finished article {segment.get('abstract_number', '')}: exported {generated_path.name}; "
-            f"locked {locked_count} block(s)."
-        )
-        QMessageBox.information(
-            self,
-            "Article finished",
-            f"Article {segment.get('abstract_number', '')} was exported to {generated_path.name}\n"
-            f"and {locked_count} field block(s) are now locked.",
+        self._refresh_after_article_change()
+        # Move the page on to the article that comes next, so finishing one is a
+        # step towards the next instead of a trip back to the tab bar.
+        following = self._segment_for_key(self._current_segment_key)
+        if following is not None:
+            self.viewer.render_page(max(0, int(following.get("start_page", 1)) - 1))
+        self._notify(
+            f"Finished article {segment.get('abstract_number', '')}: exported "
+            f"{generated_path.name}; locked {locked_count} block(s)."
         )
 
     def reopen_current_article(self) -> None:
         """Unlock the most recently finished article for further editing."""
 
         if self.document is None:
-            QMessageBox.information(self, "No document", "Load a PDF first.")
+            self._notify("Load a PDF first.")
             return
-        if not self._finished_segment_keys:
-            QMessageBox.information(self, "Nothing to reopen", "No finished article is available to reopen.")
-            return
-        finished = self._segments_with_keys()
-        candidates = [(segment, key) for segment, key in finished if key in self._finished_segment_keys]
+        candidates = [
+            (segment, key)
+            for segment, key in self._segments_with_keys()
+            if key in self._finished_segment_keys
+        ]
         if not candidates:
-            QMessageBox.information(self, "Nothing to reopen", "No finished article is available to reopen.")
+            self._notify("No finished article is available to reopen.")
             return
         segment, key = candidates[-1]
+        self._reopen_segment(segment, key)
+
+    def reopen_article(self, segment: dict[str, object] | None = None) -> bool:
+        """Unlock one named article again, from its own tab or menu.
+
+        The button reopens the last finished article; a multi-article PDF needs
+        any of them to be reachable, not just the most recent one.
+        """
+
+        if self.document is None:
+            self._notify("Load a PDF first.")
+            return False
+        if segment is None:
+            self._notify("Select an article tab before reopening one.")
+            return False
+        key = self._segment_key(segment)
+        if key is None or key not in self._finished_segment_keys:
+            self._notify("That article is not finished.")
+            return False
+        self._reopen_segment(segment, key)
+        return True
+
+    def _reopen_segment(self, segment: dict[str, object], key: str | None) -> int:
+        """Unlock a finished article's blocks and refresh the views."""
+
         unlocked_count = self._unlock_segment_blocks(segment, key)
         if self._current_segment_key == key:
             self._current_segment_key = None
-        self._update_document_model()
-        self.viewer.set_blocks([asdict(block) for block in self.document.blocks])
-        self.viewer.set_zones([asdict(zone) for zone in self.document.zones])
-        self._populate_tree()
-        self._update_html_preview()
-        self._update_selection_panel()
-        self._refresh_article_buttons()
-        self._log(f"Reopened article {segment.get('abstract_number', '')}; unlocked {unlocked_count} block(s).")
-        QMessageBox.information(
-            self,
-            "Article reopened",
-            f"Article {segment.get('abstract_number', '')} was unlocked ({unlocked_count} block(s)).",
+        self._refresh_after_article_change()
+        self._notify(
+            f"Reopened article {segment.get('abstract_number', '')}; "
+            f"unlocked {unlocked_count} block(s)."
         )
+        return unlocked_count
 
-    def _next_unfinished_segment_key(self) -> tuple | None:
+    def _next_unfinished_segment_key(self) -> str | None:
         for _segment, key in self._segments_with_keys():
             if key not in self._finished_segment_keys:
                 return key
@@ -1088,6 +1367,7 @@ class MainWindow(QMainWindow):
             self.reopen_article_btn.setEnabled(False)
             self.metadata_panel.set_abstract_number("", enabled=False)
             self.author_affiliation_review_panel.set_link_review([], [], [], enabled=False)
+            self._update_split_segment_button()
             self._refresh_articles_list()
             return
         # The abstract number is article-level, so the inspector mirrors the
@@ -1104,6 +1384,7 @@ class MainWindow(QMainWindow):
             self.finish_article_btn.setText(f"Finish {abstract_number}" if abstract_number else "Finish Article")
             self.metadata_panel.set_abstract_number(abstract_number)
         self.reopen_article_btn.setEnabled(bool(self._finished_segment_keys))
+        self._update_split_segment_button()
         self._refresh_link_review()
         self._refresh_articles_list()
 
@@ -1140,11 +1421,21 @@ class MainWindow(QMainWindow):
             if finished:
                 summary.setStyleSheet("color: #9a9a9a;")
             page_layout.addWidget(summary)
-            current_marker = " (current)" if key == self._current_segment_key else ""
+            is_current = key is not None and key == self._current_segment_key
+            current_marker = " (current)" if is_current else ""
             page_layout.addWidget(
-                QLabel(f"{len(segments)} detected; click a tab to make it the working article{current_marker}.")
+                QLabel(
+                    f"{len(segments)} detected; this is the working article{current_marker}."
+                    if is_current
+                    else f"{len(segments)} detected; click this tab to make it the working article."
+                )
             )
-            index = self.articles_tabs.addTab(tab_page, self._segment_tab_title(segment, finished))
+            page_layout.addWidget(
+                QLabel("Right-click this tab to name the article, merge it, or reopen it.")
+            )
+            index = self.articles_tabs.addTab(
+                tab_page, self._segment_tab_title(segment, finished, is_current)
+            )
             self.articles_tabs.setTabToolTip(index, self._segment_summary(segment))
             if key == previous_key:
                 self.articles_tabs.setCurrentIndex(index)
@@ -1154,21 +1445,42 @@ class MainWindow(QMainWindow):
         if self.document is None:
             self.articles_hint.setText("Load a PDF to see detected articles.")
         elif not segments:
-            self.articles_hint.setText("No article segments detected; the PDF exports as one article.")
-        elif len(segments) == 1:
-            self.articles_hint.setText("1 article detected.")
-        else:
             self.articles_hint.setText(
-                f"{len(segments)} articles detected. Click a tab to work on one; use Merge Current With... for false splits."
+                "No article boundary was detected, so the PDF exports as one article. "
+                "Right-click the first line of each following article in the page and choose "
+                "\"Start a new article here\" (or press Ctrl+Shift+N) to mark them by hand."
             )
+        else:
+            unfinished = len(
+                [
+                    segment
+                    for segment in segments
+                    if self._segment_key(segment) not in self._finished_segment_keys
+                ]
+            )
+            if not unfinished:
+                self.articles_hint.setText(
+                    f"All {len(segments)} articles are finished. Right-click a line in the page, "
+                    "or use Reopen Article, to change one."
+                )
+            else:
+                self.articles_hint.setText(
+                    f"{len(segments)} articles detected; {unfinished} left to finish. Click a tab "
+                    "to work on one, right-click a line in the page to start an article there, and "
+                    "use Merge Into Previous for a split that cut an article in two."
+                )
         self._update_merge_segments_button()
 
     @staticmethod
-    def _segment_tab_title(segment: dict[str, object], finished: bool) -> str:
-        """Short tab caption: article number plus optional finished marker."""
+    def _segment_tab_title(
+        segment: dict[str, object], finished: bool, current: bool = False
+    ) -> str:
+        """Short tab caption: article number plus finished/working markers."""
 
         number = str(segment.get("abstract_number", "")).strip() or "ABSN"
-        return f"🔒 {number}" if finished else number
+        if finished:
+            return f"🔒 {number}"
+        return f"● {number}" if current else number
 
     def _on_article_tab_clicked(self, index: int) -> None:
         """Make the clicked article tab the working article and show its page."""
@@ -1197,25 +1509,123 @@ class MainWindow(QMainWindow):
         return segments[index] if 0 <= index < len(segments) else None
 
     def _show_article_tab_menu(self, position) -> None:
-        """Context menu: merge this article with another detected one."""
+        """Per-article menu: name it, fold it back, or reopen it."""
 
         index = self.articles_tabs.tabBar().tabAt(position)
         segment = self._segment_at_tab(index)
         if segment is None:
             return
         key = self._segment_key(segment)
-        if key in self._finished_segment_keys:
-            QMessageBox.information(
-                self, "Article finished", "Reopen finished articles before merging them."
-            )
-            return
-        menu = QMenu(self)
-        merge_action = menu.addAction(f"Merge ABSN {segment.get('abstract_number', '')} with...")
-        chosen = menu.exec(self.articles_tabs.mapToGlobal(position))
-        if chosen is merge_action:
+        if key is not None:
             self._current_segment_key = key
             self._refresh_article_buttons()
+        finished = key in self._finished_segment_keys
+        number = str(segment.get("abstract_number", "")).strip() or "ABSN"
+        previous_key = self._neighbour_boundary_key(key, -1)
+        next_key = self._neighbour_boundary_key(key, 1)
+        mergeable = not finished
+        menu = QMenu(self)
+        rename_action = menu.addAction(f"Set article number for {number}...")
+        previous_action = menu.addAction("Merge into the previous article")
+        next_action = menu.addAction("Merge the next article into this one")
+        merge_action = menu.addAction(f"Merge {number} with another article...")
+        reopen_action = menu.addAction("Reopen this article") if finished else None
+        previous_action.setEnabled(
+            mergeable
+            and previous_key is not None
+            and previous_key not in self._finished_segment_keys
+        )
+        next_action.setEnabled(
+            mergeable and next_key is not None and next_key not in self._finished_segment_keys
+        )
+        merge_action.setEnabled(mergeable)
+        chosen = menu.exec(self.articles_tabs.mapToGlobal(position))
+        if chosen is None:
+            return
+        if chosen is rename_action:
+            self.set_article_number(segment)
+            return
+        if chosen is previous_action:
+            self.merge_article_with_previous(segment)
+            self._refresh_article_buttons()
+            return
+        if chosen is next_action:
+            self.merge_article_with_next(segment)
+            self._refresh_article_buttons()
+            return
+        if chosen is merge_action:
             self.merge_selected_segments()
+            return
+        if reopen_action is not None and chosen is reopen_action:
+            self.reopen_article(segment)
+
+    def _show_block_article_menu(self, block_id: str, global_pos) -> None:
+        """Right-click menu on a line: cut a new article here or repair a bad cut.
+
+        The line under the cursor becomes the selection first, so the action and
+        its result land on the article the user pointed at rather than on
+        whichever block happened to be selected before.
+        """
+
+        if self.document is None or not block_id:
+            return
+        if not any(block.id == block_id for block in self.document.blocks):
+            return
+        self._on_viewer_block_selected(block_id, False)
+        ordered = self._ensure_reading_orders()
+        starts_article = block_id in set(self._boundary_block_ids())
+        is_first = bool(ordered) and ordered[0].id == block_id
+        segment = self._segment_for_key(block_id)
+        menu = QMenu(self)
+        split_action = menu.addAction("Start a new article here")
+        split_action.setEnabled(not starts_article and not is_first)
+        previous_key = self._neighbour_boundary_key(block_id, -1)
+        next_key = self._neighbour_boundary_key(block_id, 1)
+        previous_action = menu.addAction("Merge this article into the previous one")
+        previous_action.setEnabled(
+            starts_article
+            and previous_key is not None
+            and previous_key not in self._finished_segment_keys
+        )
+        next_action = menu.addAction("Merge the next article into this one")
+        next_action.setEnabled(
+            starts_article
+            and next_key is not None
+            and next_key not in self._finished_segment_keys
+        )
+        menu.addSeparator()
+        number_action = menu.addAction("Set article number...")
+        number_action.setEnabled(segment is not None)
+        chosen = menu.exec(global_pos)
+        if chosen is None:
+            return
+        if chosen is split_action:
+            self._split_here(block_id)
+            return
+        if chosen is previous_action:
+            self.merge_article_with_previous(segment)
+            self._refresh_article_buttons()
+            return
+        if chosen is next_action:
+            self.merge_article_with_next(segment)
+            self._refresh_article_buttons()
+            return
+        if chosen is number_action:
+            self.set_article_number(segment)
+
+    def _show_tree_article_menu(self, position) -> None:
+        """Offer the same article actions for a line clicked in the tree."""
+
+        item = self.tree.itemAt(position)
+        while item is not None and not item.data(0, Qt.UserRole):
+            item = item.parent()
+        if item is None:
+            return
+        block_id = str(item.data(0, Qt.UserRole) or "")
+        if block_id:
+            self._show_block_article_menu(
+                block_id, self.tree.viewport().mapToGlobal(position)
+            )
 
     def _update_merge_segments_button(self) -> None:
         """Enable merging while at least two unfinished articles exist."""
@@ -1227,6 +1637,28 @@ class MainWindow(QMainWindow):
             if self._segment_key(segment) not in self._finished_segment_keys
         ]
         self.merge_segments_btn.setEnabled(len(unfinished) >= 2)
+        if not hasattr(self, "merge_previous_btn"):
+            return
+        current = self._current_segment()
+        if current is None:
+            self.merge_previous_btn.setEnabled(False)
+            return
+        current_segment, key = current
+        previous = self._neighbour_segment(current_segment, -1)
+        self.merge_previous_btn.setEnabled(
+            key not in self._finished_segment_keys
+            and previous is not None
+            and self._segment_key(previous) not in self._finished_segment_keys
+        )
+
+    def _update_split_segment_button(self) -> None:
+        """Enable splitting while exactly one block is selected as the boundary."""
+
+        if not hasattr(self, "split_segment_btn"):
+            return
+        self.split_segment_btn.setEnabled(
+            self.document is not None and len(self._selected_block_ids) == 1
+        )
 
     def _segment_summary(self, segment: dict[str, object]) -> str:
         """Describe one detected article as a single readable line."""
@@ -1239,7 +1671,16 @@ class MainWindow(QMainWindow):
         columns = segment.get("columns") or []
         column_text = "" if not columns else " col" + ",".join(str(column) for column in columns)
         state = " | finished" if self._segment_key(segment) in self._finished_segment_keys else ""
-        text = f"{index}. ABSN {number} | {pages}{column_text}{state}"
+        # The stored vocabulary reads reading-order bounds as "split by hand",
+        # but the boundary model records the real origin beside them.
+        boundary_source = str(segment.get("boundary_source") or "")
+        manual = (
+            " | manual split"
+            if boundary_source == SOURCE_MANUAL
+            or (not boundary_source and segment_is_manual(segment))
+            else ""
+        )
+        text = f"{index}. ABSN {number} | {pages}{column_text}{state}{manual}"
         snippet = ""
         if self.document is not None:
             title_blocks = sorted(
@@ -1253,6 +1694,146 @@ class MainWindow(QMainWindow):
             snippet = " ".join(" ".join(block.text.split()) for block in title_blocks)
         return f"{text} | {snippet[:70]}" if snippet else text
 
+    # A conference marker printed on a line of its own ("P-605", "S100", "4349").
+    MANUAL_ARTICLE_NUMBER = re.compile(
+        r"^(?:[A-Za-z]{1,4}[-.]?)?\d{2,6}(?:[./-][A-Za-z0-9]{1,6})*$"
+    )
+
+    def _ensure_reading_orders(self) -> list:
+        """Number every block by reading position, and return them in that order.
+
+        A hand-made split is stored as reading-order bounds, which can only be
+        compared when every block carries an index. Extraction already records
+        one and merged blocks inherit it, so a document that is fully numbered
+        is left untouched; anything else is numbered from the column-aware
+        reading order the UI already uses.
+        """
+
+        if self.document is None:
+            return []
+        ordered = self._sort_reading_order(self.document.blocks)
+        if all(block.metadata.get("reading_order") is not None for block in ordered):
+            return ordered
+        for position, block in enumerate(ordered, start=1):
+            block.metadata["reading_order"] = position
+        # A manual split is stored as reading-order bounds, so numbering the
+        # blocks changes which article owns which block.
+        self._invalidate_segment_identity()
+        return ordered
+
+    def _replace_article_segments(self, segments: list[dict[str, object]]) -> None:
+        """Store a new segment list, renumbered into reading order.
+
+        Article identity is the block an article starts at, so renumbering does
+        not disturb which article the user is working on or which ones are
+        finished: both stay attached to their own article.
+        """
+
+        if self.document is None:
+            return
+        ordered = sorted(
+            (segment for segment in segments if isinstance(segment, dict)),
+            key=lambda segment: (
+                int(segment.get("start_page", 1)),
+                min((int(column) for column in segment.get("columns") or []), default=0),
+                int(segment["start_order"]) if segment.get("start_order") is not None else -1,
+                int(segment.get("index", 0)),
+            ),
+        )
+        for position, segment in enumerate(ordered, start=1):
+            segment["index"] = position
+        self.document.metadata["article_segments"] = ordered
+        self._invalidate_segment_identity()
+
+    def _manual_article_number(self, block) -> str:
+        """Return the article number a block prints, for a hand-made split.
+
+        Detection needs a label or parentheses ("Abstract No: 4349") because a
+        bare token is ambiguous with a page number. A person drawing the
+        boundary has already decided the block starts an article, so the bare
+        marker those conference PDFs print ("P-605") counts here.
+        """
+
+        cleaned = " ".join(str(block.text or "").split())
+        labelled = abstract_number_marker(cleaned)
+        if labelled:
+            return labelled
+        if not self.MANUAL_ARTICLE_NUMBER.fullmatch(cleaned):
+            return ""
+        return cleaned
+
+    def split_article_at_block(self, block_id: str) -> dict[str, object] | None:
+        """Start a new article at one block and return the segment it created.
+
+        Articles are boundaries over one reading stream, so a cut simply inserts
+        a boundary: everything before it stays with the article that already
+        owned it and everything from it on becomes a new article. That is the
+        only way to separate two articles sharing a page *and* a column, and it
+        cannot leave a block owned by two articles or by none.
+
+        Returns ``None`` when the cut is void: an unknown block, the first line
+        of the document, or a line that already starts an article.
+        """
+
+        if self.document is None:
+            return None
+        ordered = self._ensure_reading_orders()
+        segmentation = self._article_segmentation(ordered)
+        if segmentation is None:
+            return None
+        # The cut is keyed on the id: two lines of a PDF can be identical, and a
+        # value comparison would then cut at the first copy instead.
+        if not segmentation.insert_boundary(block_id, source=SOURCE_MANUAL):
+            return None
+        # Name each article from the marker line it starts with, when it prints
+        # one; an article without a marker stays ABSN and is named by hand.
+        self._name_articles_from_markers(segmentation, ordered)
+        self._push_article_undo("split article")
+        self._replace_article_segments(
+            segmentation.to_legacy_segments(self.document.blocks)
+        )
+        self._current_segment_key = block_id
+        self._report_segmentation_issues(segmentation)
+        return self._segment_for_key(block_id)
+
+    def _split_here(self, block_id: str) -> None:
+        """Split at one line from the UI and report the outcome without a dialog."""
+
+        if self.document is None:
+            self._notify("Load a PDF first.")
+            return
+        segment = self.split_article_at_block(block_id)
+        if segment is None:
+            self._notify(
+                "That line already starts an article; pick the first line of the "
+                "next article instead."
+            )
+            return
+        self._refresh_article_buttons()
+        number = str(segment.get("abstract_number", "")).strip() or "ABSN"
+        self._notify(
+            f"Article {segment.get('index')} (ABSN {number}) now starts at {block_id} "
+            f"on page {segment.get('start_page')}."
+        )
+
+    def split_article_at_selection(self) -> None:
+        """Start a new article at the selected block, splitting the PDF by hand."""
+
+        if self.document is None:
+            self._notify("Load a PDF first.")
+            return
+        selected = sorted(
+            (block for block in self.document.blocks if block.id in self._selected_block_ids),
+            key=reading_order_key,
+        )
+        if len(selected) != 1:
+            self._notify(
+                "Select exactly one line first: the first line of the article that "
+                "starts at that point in the PDF."
+            )
+            return
+        self._split_here(selected[0].id)
+
     def merge_selected_segments(self) -> None:
         """Fold falsely split articles into the current one after a picker."""
 
@@ -1260,15 +1841,11 @@ class MainWindow(QMainWindow):
             return
         current = self._current_segment()
         if current is None:
-            QMessageBox.information(
-                self, "No article", "No unfinished article is available as the merge target."
-            )
+            self._notify("No unfinished article is available as the merge target.")
             return
         target_segment, target_key = current
         if target_key in self._finished_segment_keys:
-            QMessageBox.information(
-                self, "Article finished", "Reopen finished articles before merging them."
-            )
+            self._notify("Reopen the finished article before merging into it.")
             return
         candidates = [
             segment
@@ -1277,62 +1854,142 @@ class MainWindow(QMainWindow):
             and self._segment_key(segment) not in self._finished_segment_keys
         ]
         if not candidates:
-            QMessageBox.information(
-                self, "Nothing to merge", "No other unfinished article was detected."
-            )
+            self._notify("No other unfinished article was detected.")
             return
         chosen = self._choose_merge_candidates(target_segment, candidates)
         if not chosen:
             return
-        chosen.append(target_segment)
-        chosen.sort(
-            key=lambda segment: (int(segment.get("start_page", 1)), int(segment.get("index", 0)))
+        self._merge_article_segments([*chosen, target_segment])
+
+    def merge_article_with_previous(
+        self, segment: dict[str, object] | None = None
+    ) -> dict[str, object] | None:
+        """Fold one article into the one before it, without a dialog.
+
+        A wrong split is the commonest mistake while working through a PDF, so
+        repairing it is one click instead of a picker and a confirmation.
+        """
+
+        if self.document is None:
+            return None
+        target = segment if segment is not None else (self._current_segment() or (None, None))[0]
+        if target is None:
+            self._notify("Select an article tab before merging articles.")
+            return None
+        previous = self._neighbour_segment(target, -1)
+        if previous is None:
+            self._notify("This is the first article; there is nothing before it to fold into.")
+            return None
+        return self._merge_article_segments([previous, target])
+
+    def merge_article_with_next(
+        self, segment: dict[str, object] | None = None
+    ) -> dict[str, object] | None:
+        """Fold the article after one into it, without a dialog."""
+
+        if self.document is None:
+            return None
+        target = segment if segment is not None else (self._current_segment() or (None, None))[0]
+        if target is None:
+            self._notify("Select an article tab before merging articles.")
+            return None
+        following = self._neighbour_segment(target, 1)
+        if following is None:
+            self._notify("This is the last article; there is nothing after it to fold in.")
+            return None
+        return self._merge_article_segments([target, following])
+
+    def _merge_article_segments(
+        self, segments: list[dict[str, object]]
+    ) -> dict[str, object] | None:
+        """Fold several articles into one, keeping the earliest boundary.
+
+        Merging removes boundaries instead of rewriting page ranges, so the
+        articles that stay keep exactly the blocks they already owned and the
+        merged one covers the whole span. Everything between the first and the
+        last chosen article folds in with them.
+        """
+
+        if self.document is None:
+            return None
+        ordered = self._ensure_reading_orders()
+        segmentation = self._article_segmentation(ordered)
+        if segmentation is None:
+            return None
+        positions = sorted(
+            {
+                position
+                for position in (
+                    segmentation.article_position(self._segment_key(segment) or "")
+                    for segment in segments
+                )
+                if position is not None
+            }
         )
-        target = chosen[0]
-        # Capture the pre-merge identity before the target is resized; the target
-        # itself must be filtered out by index and then re-added once.
-        merged_keys = {self._segment_key(segment) for segment in chosen}
-        merged_indices = {int(segment.get("index", 0)) for segment in chosen}
-        current_key = self._current_segment_key
-        target["start_page"] = min(int(segment.get("start_page", 1)) for segment in chosen)
-        target["end_page"] = max(
-            int(segment.get("end_page", target["start_page"])) for segment in chosen
-        )
-        column_sets = [list(segment.get("columns") or []) for segment in chosen]
-        target["columns"] = (
-            column_sets[0]
-            if column_sets[0] and all(columns == column_sets[0] for columns in column_sets)
-            else None
-        )
-        remaining = [
-            segment
-            for segment in segments
-            if int(segment.get("index", 0)) not in merged_indices
+        if len(positions) < 2:
+            self._notify("Merging needs at least two articles; nothing was changed.")
+            return None
+        target_position = positions[0]
+        participants = [
+            segmentation.boundaries[position].block_id
+            for position in range(target_position, positions[-1] + 1)
         ]
-        remaining.append(target)
-        remaining.sort(
-            key=lambda segment: (int(segment.get("start_page", 1)), int(segment.get("index", 0)))
+        if any(block_id in self._finished_segment_keys for block_id in participants):
+            self._notify("Reopen the finished article before merging it.")
+            return None
+        merged = 0
+        for block_id in participants[1:]:
+            if segmentation.remove_boundary(block_id):
+                merged += 1
+        if not merged:
+            self._notify("Nothing was changed; those articles are already one.")
+            return None
+        self._push_article_undo("merge articles")
+        self._replace_article_segments(
+            segmentation.to_legacy_segments(self.document.blocks)
         )
-        # Renumbering changes each segment key, so finished/current bookkeeping
-        # is remapped through the old-to-new table.
-        key_map: dict[tuple, tuple] = {}
-        for position, segment in enumerate(remaining, start=1):
-            old_key = self._segment_key(segment)
-            segment["index"] = position
-            new_key = self._segment_key(segment)
-            if old_key is not None and new_key is not None:
-                key_map[old_key] = new_key
-        if current_key in merged_keys:
-            self._current_segment_key = self._segment_key(target)
-        elif current_key is not None:
-            self._current_segment_key = key_map.get(current_key, current_key)
-        self._finished_segment_keys = [key_map.get(key, key) for key in self._finished_segment_keys]
-        self.document.metadata["article_segments"] = remaining
+        key = segmentation.boundaries[target_position].block_id
+        self._current_segment_key = key
+        self._report_segmentation_issues(segmentation)
+        target = self._segment_for_key(key)
+        number = str((target or {}).get("abstract_number", "")).strip() or "ABSN"
+        if target is not None:
+            self._notify(
+                f"Merged {merged + 1} articles into one: ABSN {number} "
+                f"(pages {target.get('start_page')}-{target.get('end_page')})."
+            )
+        return target
+
+    def set_article_number(self, segment: dict[str, object] | None = None) -> bool:
+        """Ask for an article's number and store it on that article only.
+
+        Each article carries its own Abstract No, so naming one never renames
+        the others; the tab and the exported XML follow the article it belongs to.
+        """
+
+        target = segment if segment is not None else (self._current_segment() or (None, None))[0]
+        if self.document is None or target is None:
+            self._notify("Select an article tab before naming one.")
+            return False
+        current = str(target.get("abstract_number", "")).strip()
+        entered, accepted = QInputDialog.getText(
+            self,
+            "Article number",
+            f"Abstract number for article {target.get('index', '?')} "
+            f"(pages {target.get('start_page')}-{target.get('end_page')}):",
+            text=current,
+        )
+        if not accepted:
+            return False
+        number = self._normalize_abstract_number(entered)
+        if not number:
+            self._notify('Enter a single identifier such as "4349" or "P-605".')
+            return False
+        self._push_article_undo("rename article")
+        self._set_abstract_number(number, target)
         self._refresh_article_buttons()
-        self._log(
-            f"Merged {len(chosen)} article segments into one: ABSN "
-            f"{target.get('abstract_number', '')} p{target['start_page']}-{target['end_page']}."
-        )
+        self._notify(f"Article {target.get('index', '?')} is now ABSN {number}.")
+        return True
 
     def _choose_merge_candidates(
         self, target_segment: dict[str, object], candidates: list[dict[str, object]]
@@ -1344,7 +2001,8 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(dialog)
         hint = QLabel(
             "Select the articles that were split by mistake; they fold into "
-            f"ABSN {target_segment.get('abstract_number', '')}. Ctrl-click for several."
+            f"ABSN {target_segment.get('abstract_number', '')}, along with anything "
+            "between them. Ctrl-click for several."
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -1463,8 +2121,10 @@ class MainWindow(QMainWindow):
             if any(line_id in block_ids for line_id in paragraph.source_line_ids)
         ]
         metadata = dict(source.metadata)
-        metadata["abstract_number"] = str(segment.get("abstract_number", "ABSN"))
-        metadata["abstract_number_block_ids"] = [str(segment.get("abstract_number_block_id", ""))]
+        metadata["abstract_number"] = str(segment.get("abstract_number") or "ABSN")
+        # A hand-made article usually has no marker block to exclude.
+        marker_id = str(segment.get("abstract_number_block_id") or "")
+        metadata["abstract_number_block_ids"] = [marker_id] if marker_id else []
         metadata["article_segment"] = dict(segment)
         metadata.pop("article_segments", None)
         abstract_number = str(metadata["abstract_number"])
@@ -1591,12 +2251,16 @@ class MainWindow(QMainWindow):
         candidates = page1_blocks if page1_blocks else title_blocks
         top = candidates[0]
         grouped = [top]
-        baseline = top.y + top.height
         for block in candidates[1:]:
-            if block.y - baseline > max(top.height, block.height) * 1.6:
+            previous = grouped[-1]
+            # A title reads down one column. Once the stream steps back up the
+            # page it has wrapped to the next column, where the following
+            # article lives, so the title ends at the previous line.
+            if block.page != previous.page or block.y < previous.y:
+                break
+            if block.y - (previous.y + previous.height) > max(previous.height, block.height) * 1.6:
                 break
             grouped.append(block)
-            baseline = max(baseline, block.y + block.height)
         parts = [self._sanitize_xml_text(block.text).strip() for block in grouped if self._sanitize_xml_text(block.text).strip()]
         title = " ".join(parts) if parts else self._sanitize_xml_text(top.text)
         # Conference abstracts commonly prefix the title with an identifier such
@@ -2167,8 +2831,8 @@ class MainWindow(QMainWindow):
     def _set_abstract_number(self, abstract_number: str, target: dict[str, object] | None) -> None:
         """Store an abstract number on the document and, when known, its segment.
 
-        Changing the segment value changes its key, so the current and finished
-        article bookkeeping is remapped to match.
+        Naming an article does not change which block starts it, so the working
+        and finished article bookkeeping stays valid as it is.
         """
 
         previous = self._normalize_abstract_number(self.document.metadata.get("abstract_number", ""))
@@ -2181,18 +2845,8 @@ class MainWindow(QMainWindow):
                 aliases.append(previous)
             self.document.metadata["abstract_number_aliases"] = aliases
         self.document.metadata["abstract_number"] = abstract_number
-        if target is None:
-            return
-        old_key = self._segment_key(target)
-        target["abstract_number"] = abstract_number
-        new_key = self._segment_key(target)
-        if old_key is None or new_key is None or old_key == new_key:
-            return
-        if self._current_segment_key == old_key:
-            self._current_segment_key = new_key
-        self._finished_segment_keys = [
-            new_key if key == old_key else key for key in self._finished_segment_keys
-        ]
+        if target is not None:
+            target["abstract_number"] = abstract_number
 
     def _apply_abstract_number_role(self, block) -> None:
         """Record a block tagged ``abstract_number`` as the article marker.
@@ -2211,7 +2865,9 @@ class MainWindow(QMainWindow):
         if block.id not in marker_ids:
             marker_ids.append(block.id)
             self.document.metadata["abstract_number_block_ids"] = marker_ids
-        value = abstract_number_marker(block.text)
+        # A person may tag a bare marker such as "P-605", which auto-detection
+        # rejects as ambiguous; for a hand-tagged block the bare token counts.
+        value = abstract_number_marker(block.text) or self._manual_article_number(block)
         if not value:
             return
         target = next(
@@ -2230,10 +2886,17 @@ class MainWindow(QMainWindow):
             target["abstract_number_block_id"] = block.id
 
     def _clear_abstract_number_role(self, block_id: str) -> None:
-        """Undo the marker metadata after a person untags a block."""
+        """Undo the marker metadata after a person untags a block.
+        When the tagged marker is what started an article, untagging it also
+        folds that article back into the one before it: the tag and the article
+        boundary live and die together.
+        """
 
         if self.document is None:
             return
+        # Fold the marker's article back while the segments still remember that
+        # this block started one; the cleanup below then erases the rest.
+        self._remove_marker_boundary(block_id)
         marker_ids = [
             str(value)
             for value in self.document.metadata.get("abstract_number_block_ids", [])
@@ -2244,13 +2907,140 @@ class MainWindow(QMainWindow):
             if str(segment.get("abstract_number_block_id", "")) == block_id:
                 segment.pop("abstract_number_block_id", None)
 
+    def _remove_marker_boundary(self, block_id: str) -> None:
+        """Fold back the article a tagged marker created, if it still exists."""
+
+        segments = self._document_segments()
+        if not segments:
+            return
+        started_here = [
+            segment
+            for segment in segments
+            if str(segment.get("abstract_number_block_id", "")) == block_id
+            and str(segment.get("boundary_source", "")) == SOURCE_MANUAL
+            and int(segment.get("index", 0)) > 1
+        ]
+        if not started_here:
+            return
+        ordered = self._ensure_reading_orders()
+        segmentation = self._article_segmentation(ordered)
+        if segmentation is None:
+            return
+        boundary = next(
+            (entry for entry in segmentation.boundaries if entry.block_id == block_id),
+            None,
+        )
+        if boundary is None or boundary.marker_block_id != block_id:
+            return
+        if not segmentation.remove_boundary(block_id):
+            return
+        self._push_article_undo("merge marker article back")
+        self._replace_article_segments(
+            segmentation.to_legacy_segments(self.document.blocks)
+        )
+        self._report_segmentation_issues(segmentation)
+        self._refresh_article_buttons()
+        self._notify(
+            f"Untagged marker {block_id}; its article folded into the one before it."
+        )
+
     def _sync_block_abstract_number_role(self, block, previous_role: str) -> None:
-        """Apply or undo marker metadata after a manual role change."""
+        """Apply or undo marker metadata after a manual role change.
+
+        Tagging a block ``abstract_number`` does more than record the marker:
+        when the marker prints a fresh number it also starts a new article at
+        that block, so the classification itself drives the article boundaries
+        instead of a separate split step.
+        """
 
         if block.role == "abstract_number":
+            # Cut first: the marker starts the new article, so the number that
+            # _apply_abstract_number_role records must land on the article the
+            # marker starts, not on the one that happens to contain the block
+            # before the cut exists.
+            self._maybe_split_article_at_marker(block)
             self._apply_abstract_number_role(block)
         elif previous_role == "abstract_number":
             self._clear_abstract_number_role(block.id)
+
+    # A running head or banner line is page furniture, never an article
+    # marker, so tagging one by mistake must not cut the article there.
+    MARKER_NOISE = re.compile(
+        r"(?:\b\d{4}\b.*\b(?:symposium|congress|conference|meeting|society)\b"
+        r"|\b(?:symposium|congress|conference|meeting|society)\b.*\b\d{4}\b"
+        r"|\u00a9|copyright)",
+        re.IGNORECASE,
+    )
+
+    def _marker_starts_article(self, block) -> bool:
+        """Return True when tagging this marker should start a new article."""
+
+        if self.MARKER_NOISE.search(str(block.text or "")):
+            return False
+        value = abstract_number_marker(str(block.text or ""))
+        if not value:
+            # A person tagged it deliberately: a bare marker such as "P-605"
+            # still counts, but only when the line holds nothing else.
+            cleaned = " ".join(str(block.text or "").split())
+            return bool(self.MANUAL_ARTICLE_NUMBER.fullmatch(cleaned))
+        return True
+
+    def _maybe_split_article_at_marker(self, block) -> None:
+        """Start a new article when a tagged marker prints a fresh number.
+        The user classifies the roles of an article, and the moment they tag a
+        fresh ``abstract_number`` the classification cuts the stream there: the
+        article before the marker is complete, and everything from the marker
+        on belongs to the next one. Tagging the same marker again (a corrected
+        number) only renames the article it already starts.
+        """
+
+        if self.document is None:
+            return
+        number = self._manual_article_number(block)
+        if not number or not self._marker_starts_article(block):
+            return
+        ordered = self._ensure_reading_orders()
+        segmentation = self._article_segmentation(ordered)
+        if segmentation is None:
+            return
+        position = next(
+            (index for index, boundary in enumerate(segmentation.boundaries) if boundary.block_id == block.id),
+            None,
+        )
+        if position is not None:
+            # The marker already starts an article: adopt the corrected number
+            # and remember the block as the marker, but never cut twice.
+            current = segmentation.boundaries[position]
+            if current.number != number or current.marker_block_id != block.id:
+                segmentation.boundaries[position] = ArticleBoundary(
+                    block_id=current.block_id,
+                    source=current.source,
+                    number=number,
+                    marker_block_id=block.id,
+                )
+                self._replace_article_segments(
+                    segmentation.to_legacy_segments(self.document.blocks)
+                )
+                self._refresh_article_buttons()
+                self._notify(f"Article at {block.id} renamed to ABSN {number}.")
+            return
+        if not segmentation.insert_boundary(
+            block.id, source=SOURCE_MANUAL, number=number, marker_block_id=block.id
+        ):
+            return
+        # The article before the marker may print its own number on its first
+        # line; name it the same way a hand-made split does.
+        self._name_articles_from_markers(segmentation, ordered)
+        self._push_article_undo("split article at marker")
+        self._replace_article_segments(
+            segmentation.to_legacy_segments(self.document.blocks)
+        )
+        self._current_segment_key = block.id
+        self._report_segmentation_issues(segmentation)
+        self._refresh_article_buttons()
+        self._notify(
+            f"Article {number} starts at {block.id}; the article before it is ready to finish."
+        )
 
     def _sync_abstract_number_from_roles(self) -> str:
         """Adopt the Abstract No from a tagged marker when extraction missed it.
@@ -2385,6 +3175,8 @@ class MainWindow(QMainWindow):
         remaining_blocks.append(merged_block)
         remaining_blocks = self._sort_reading_order(remaining_blocks)
         self.document.blocks = remaining_blocks
+        # Fusing blocks changes which block starts an article.
+        self._invalidate_segment_identity()
         self._selected_block_ids = {merged_block.id}
         self._selected_zone_ids.clear()
         self._selected_zone_id = None
@@ -2574,6 +3366,7 @@ class MainWindow(QMainWindow):
         self.document.blocks = [block for block in self.document.blocks if block.id != merged_id]
         self.document.blocks.extend(original_blocks)
         self.document.blocks.sort(key=reading_order_key)
+        self._invalidate_segment_identity()
         self._selected_block_ids = {block.id for block in original_blocks}
         self._redo_manual_merge = {
             "merged_id": merged_id,
@@ -2607,6 +3400,9 @@ class MainWindow(QMainWindow):
 
         action = self._undo_stack.pop()
         action_type = str(action.get("type", ""))
+        if action_type == "article_segments":
+            self._restore_article_snapshot(action)
+            return
         if action_type == "zone_create":
             zone_id = str(action.get("zone_id", ""))
             self.document.zones = [zone for zone in self.document.zones if zone.id != zone_id]
@@ -2640,6 +3436,33 @@ class MainWindow(QMainWindow):
                 if restored:
                     self._log(f"Undid zone edit {restored.id}")
             return
+
+    def _restore_article_snapshot(self, action: dict[str, object]) -> None:
+        """Put the articles back the way they were before a split or a merge."""
+
+        if self.document is None:
+            return
+        before = action.get("before")
+        if not isinstance(before, list):
+            return
+        self.document.metadata["article_segments"] = [
+            dict(segment) for segment in before if isinstance(segment, dict)
+        ]
+        self._invalidate_segment_identity()
+        known = {key for key in self._segment_boundary_ids() if key}
+        finished_keys = action.get("finished_keys")
+        self._finished_segment_keys = [
+            str(key)
+            for key in (finished_keys if isinstance(finished_keys, list) else [])
+            if str(key) in known
+        ]
+        current_key = action.get("current_key")
+        self._current_segment_key = str(current_key) if current_key in known else None
+        self._refresh_article_buttons()
+        self._notify(
+            f"Undid {action.get('label', 'the article edit')}; "
+            f"{len(self._document_segments())} article(s) restored."
+        )
 
     def _push_zone_update_undo(self, zone: DocumentZone) -> None:
         self._undo_stack.append({"type": "zone_update", "before": self._snapshot_zone(zone)})
@@ -2770,6 +3593,7 @@ class MainWindow(QMainWindow):
         self.document.blocks = [block for block in self.document.blocks if block.id not in removed_ids]
         self.document.blocks.append(merged_block)
         self.document.blocks.sort(key=reading_order_key)
+        self._invalidate_segment_identity()
         self._selected_block_ids = {merged_block.id}
         self._last_manual_merge = {
             "merged_id": merged_block.id,
@@ -2958,6 +3782,7 @@ class MainWindow(QMainWindow):
     def _update_selection_panel(self) -> None:
         """Show the exact blocks currently queued for a merge."""
 
+        self._update_split_segment_button()
         if self.document is None:
             self.selection_hint.setText("Load a PDF to start selecting blocks.")
             self.selection_list.clear()
@@ -3012,6 +3837,7 @@ class MainWindow(QMainWindow):
         self._review_index = -1
         self._finished_segment_keys = []
         self._current_segment_key = None
+        self._invalidate_segment_identity()
         if refine_report.changed_count:
             self._log(
                 f"Auto-refined {refine_report.changed_count} block role(s); "

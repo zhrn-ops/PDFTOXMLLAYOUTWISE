@@ -18,6 +18,39 @@ REFINE_ROLES = frozenset(
 )
 
 
+def segment_reading_bounds(segment: dict[str, Any] | None) -> tuple[int | None, int | None]:
+    """Return the reading-order bounds a manually split article was given.
+
+    Conference PDFs print several complete articles on one page, sometimes
+    stacked inside the same column, so neither the page range nor the column of
+    a segment can separate them. A manual split therefore records the
+    document-wide reading position of the article's first line (``start_order``)
+    and of its last line (``end_order``); either bound may be missing, meaning
+    the article runs to the start or the end of the document.
+    """
+
+    if not segment:
+        return None, None
+
+    def bound(key: str) -> int | None:
+        value = segment.get(key)
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    return bound("start_order"), bound("end_order")
+
+
+def segment_is_manual(segment: dict[str, Any] | None) -> bool:
+    """Return whether a segment was created by hand rather than detected."""
+
+    start_order, end_order = segment_reading_bounds(segment)
+    return start_order is not None or end_order is not None
+
+
 def block_matches_segment(block: TextBlock, segment: dict[str, Any] | None) -> bool:
     """Return whether a block belongs to an article segment.
 
@@ -25,6 +58,12 @@ def block_matches_segment(block: TextBlock, segment: dict[str, Any] | None) -> b
     the block's recorded column is matched against the segment's columns when
     both are known. Blocks without column information still match by page, and
     a segment without columns matches every block in its page range.
+
+    Reading-order bounds narrow that result further: a segment created by hand
+    only owns the blocks between its two bounds, which is the only way to keep
+    articles that share a page *and* a column apart. Bounds are ignored for a
+    block that carries no reading position, because dropping such a block would
+    silently lose content.
     """
 
     if segment is None:
@@ -35,13 +74,26 @@ def block_matches_segment(block: TextBlock, segment: dict[str, Any] | None) -> b
         return False
     columns = segment.get("columns")
     block_column = block.metadata.get("column") if block.metadata else None
-    if columns is None:
+    if columns is not None and block_column is not None:
+        if int(block_column) not in {int(column) for column in columns}:
+            return False
+    # Full-width lines (mastheads, abstract-number markers) have no column and
+    # are attributed to the segment whose range contains them.
+    start_order, end_order = segment_reading_bounds(segment)
+    if start_order is None and end_order is None:
         return True
-    if block_column is None:
-        # Full-width lines (mastheads, abstract-number markers) span columns
-        # and are attributed to the segment whose range contains them.
+    order = (block.metadata or {}).get("reading_order")
+    if order is None:
         return True
-    return int(block_column) in {int(column) for column in columns}
+    try:
+        position = int(order)
+    except (TypeError, ValueError):
+        return True
+    if start_order is not None and position < start_order:
+        return False
+    if end_order is not None and position > end_order:
+        return False
+    return True
 
 
 @dataclass(slots=True)

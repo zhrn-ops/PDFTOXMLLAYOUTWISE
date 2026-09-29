@@ -17,6 +17,7 @@ class PdfPageLabel(QLabel):
     blockSelected = Signal(str, bool)
     blockRangeSelected = Signal(str)
     blocksRectSelected = Signal(list)
+    blockContextRequested = Signal(str, object)
     blockMoved = Signal(str, list)
     blockEditFinished = Signal(str)
     zoneSelected = Signal(str, bool)
@@ -40,6 +41,10 @@ class PdfPageLabel(QLabel):
         self._selection_band = QRubberBand(QRubberBand.Shape.Rectangle, self)
         self._selection_band.setStyleSheet("QRubberBand { border: 1px solid #4ea1ff; background: rgba(78, 161, 255, 45); }")
         self.setMouseTracking(True)
+        # Article actions are offered on the line under the cursor, which is far
+        # easier to hit than selecting exactly one block and using the button.
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._on_context_menu_requested)
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         modifiers = event.modifiers()
@@ -194,6 +199,26 @@ class PdfPageLabel(QLabel):
         self._draw_start = None
         self._draw_current = None
         super().mouseReleaseEvent(event)
+
+    def _block_id_at(self, pos) -> str | None:
+        """Return the block drawn under a point, if any."""
+
+        x = float(pos.x())
+        y = float(pos.y())
+        for region in reversed(self.property("blockRegions") or []):
+            rect = region.get("rect")
+            if region.get("kind") != "block" or not rect:
+                continue
+            if rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
+                return str(region.get("id"))
+        return None
+
+    def _on_context_menu_requested(self, pos) -> None:
+        """Offer the block menu for a right-click, ignoring empty page areas."""
+
+        block_id = self._block_id_at(pos)
+        if block_id:
+            self.blockContextRequested.emit(block_id, self.mapToGlobal(pos))
 
     def _hit_test(self, pos: QPointF, prefer_blocks: bool = False) -> str | None:
         regions = self.property("blockRegions") or []

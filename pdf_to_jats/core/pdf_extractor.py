@@ -97,9 +97,13 @@ class PDFExtractor:
                             width=float(line_bbox.width),
                             height=float(line_bbox.height),
                             font_name=font_name,
-                            font_size=font_size,
-                            bold=bool(flags & 2),
-                            italic=bool(flags & 1),
+                            font_size=font_size,                            # PyMuPDF span flags: bit 1 is italic, bit 4 is
+                            # bold. Reading them in the wrong order made every
+                            # italic author and affiliation line count as bold
+                            # (and so score as a title) while real bold titles
+                            # did not.
+                            bold=bool(flags & 16),
+                            italic=bool(flags & 2),
                             color=color,
                             alignment=self._infer_line_alignment(line, visible_area),
                             metadata={
