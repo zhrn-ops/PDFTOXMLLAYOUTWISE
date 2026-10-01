@@ -1,5 +1,7 @@
 """Tests for the per-article finish/lock workflow."""
 
+from types import SimpleNamespace
+
 from pdf_to_jats.core.pdf_extractor import PDFExtractor
 from pdf_to_jats.core.author_linker import AuthorLinker
 from pdf_to_jats.core.jats_generator import JATSGenerator
@@ -206,6 +208,7 @@ def _window(document: Document) -> MainWindow:
     window.document = document
     window._current_segment_key = None
     window._finished_segment_keys = []
+    window._deleted_segment_keys = []
     window._segment_identity_cache = None
     window._undo_stack = []
     # The articles are re-rendered into the real widgets only in a live window.
@@ -303,6 +306,34 @@ def test_article_identity_is_the_block_that_starts_it():
         "block_007",
     ]
     assert window._current_segment_key == "block_007"
+
+
+def test_selected_blocks_panel_shows_only_the_current_article():
+    """Choosing an article scopes the Selected Blocks panel to its blocks."""
+
+    document = _stacked_page_document()
+    window = _window(document)
+    window.split_article_at_block("block_004")
+    window.split_article_at_block("block_007")
+
+    # The last split leaves the third article current, and only its blocks
+    # belong in the panel.
+    assert window._current_article_block_ids() == frozenset({"block_007", "block_008"})
+
+    window._current_segment_key = "block_004"
+    assert window._current_article_block_ids() == frozenset(
+        {"block_004", "block_005", "block_006"}
+    )
+
+
+def test_no_current_article_leaves_every_block_visible():
+    """Before a tab is chosen nothing is hidden from the panel."""
+
+    document = _stacked_page_document()
+    window = _window(document)
+    window._current_segment_key = None
+
+    assert window._current_article_block_ids() is None
 
 
 def test_a_split_before_a_finished_article_keeps_its_identity():
@@ -455,6 +486,99 @@ def test_a_merge_can_be_undone_with_the_article_snapshot():
     assert window._current_segment_key == "block_007"
 
 
+def test_delete_article_hides_it_from_export_but_keeps_its_blocks():
+    """Deleting is an export decision, never a loss of content."""
+
+    document = _stacked_page_document()
+    window = _window(document)
+    window.split_article_at_block("block_004")
+    window.split_article_at_block("block_007")
+    deleted_segment = document.metadata["article_segments"][1]
+
+    assert window.delete_article(deleted_segment) is True
+    assert window._is_segment_deleted(deleted_segment) is True
+    assert window._exportable_segments(document.metadata["article_segments"])[0]["abstract_number"] == "P-605"
+    assert [segment["abstract_number"] for segment in window._exportable_segments(
+        document.metadata["article_segments"]
+    )] == ["P-605", "P-607"]
+    # The partition is untouched: no boundary moved, no block lost its owner.
+    assert len(document.metadata["article_segments"]) == 3
+
+
+def test_restore_article_puts_it_back_into_the_export():
+    document = _stacked_page_document()
+    window = _window(document)
+    window.split_article_at_block("block_004")
+    window.split_article_at_block("block_007")
+    deleted_segment = document.metadata["article_segments"][1]
+    window.delete_article(deleted_segment)
+
+    assert window.restore_article(deleted_segment) is True
+    assert window._is_segment_deleted(deleted_segment) is False
+    assert len(window._exportable_segments(document.metadata["article_segments"])) == 3
+
+
+def test_a_delete_can_be_undone_with_the_article_snapshot():
+    """Ctrl+Z after a delete brings the article back like a split or merge."""
+
+    document = _stacked_page_document()
+    window = _window(document)
+    window.split_article_at_block("block_004")
+    deleted_segment = document.metadata["article_segments"][1]
+    window.delete_article(deleted_segment)
+    assert window._deleted_segment_keys == ["block_004"]
+
+    window.undo_last_action()
+
+    assert window._deleted_segment_keys == []
+
+
+def test_delete_article_refuses_a_finished_article():
+    document = _stacked_page_document()
+    window = _window(document)
+    window.split_article_at_block("block_004")
+    window.split_article_at_block("block_007")
+    target = document.metadata["article_segments"][0]
+    key = window._segment_key(target)
+    window._finished_segment_keys.append(key)
+
+    assert window.delete_article(target) is False
+    assert window._is_segment_deleted(target) is False
+
+
+def test_finish_skips_deleted_articles_and_current_falls_to_a_live_one():
+    """A deleted article must not become the working article or be finished."""
+
+    document = _stacked_page_document()
+    window = _window(document)
+    window.split_article_at_block("block_004")
+    window.split_article_at_block("block_007")
+    window.delete_article(document.metadata["article_segments"][0])
+    # Clear the working article so _current_segment has to fall back.
+    window._current_segment_key = None
+
+    # The deleted first article is skipped as the fallback working article.
+    current = window._current_segment()
+    assert current is not None
+    assert current[1] == "block_004"
+    assert current[0]["abstract_number"] == "P-606"
+
+
+def test_the_deleted_article_view_covers_its_blocks_only():
+    """The page overlay and preview must recede exactly the deleted article."""
+
+    document = _stacked_page_document()
+    window = _window(document)
+    window.split_article_at_block("block_004")
+    window.split_article_at_block("block_007")
+    window.delete_article(document.metadata["article_segments"][1])
+
+    assert window._deleted_view_block_ids == frozenset({"block_004", "block_005", "block_006"})
+
+    window.restore_article(document.metadata["article_segments"][1])
+    assert window._deleted_view_block_ids == frozenset()
+
+
 def test_tagging_marker_block_sets_abstract_number_and_exclusion():
     marker = _block("Abstract No: 4349", block_id="m1")
     marker.role = "abstract_number"
@@ -569,3 +693,220 @@ def test_abstract_role_blocks_reach_the_generated_xml(tmp_path):
     )
     assert para is not None
     assert para.text == "We treated patients at several dose levels."
+
+
+def _finishable_window(document: Document, output) -> MainWindow:
+    """A window whose XML export is stubbed so the finish flow runs headless."""
+
+    window = _window(document)
+    window.config = SimpleNamespace(generated_xml_dir=output, output_dir=output)
+    window.linker = AuthorLinker()
+    window.viewer = None
+    window._export_article_xml = lambda segment: (output / "article.xml", [])
+    window._refresh_after_article_change = lambda: None
+    window._warn_locked_blocks = lambda blocks: None
+    return window
+
+
+def _headless_window(document: Document) -> MainWindow:
+    """A window with the Qt panes stubbed out for the role workflow."""
+
+    window = _window(document)
+    window._selected_zone_id = None
+    window._selected_zone_ids = set()
+    window._update_document_model = lambda: None
+    window._populate_tree = lambda: None
+    window._sync_tree_selection = lambda: None
+    window._update_selection_status = lambda: None
+    window._update_selection_panel = lambda: None
+    window._select_block_by_id = lambda block_id, preserve_selection=False: None
+    window.viewer = SimpleNamespace(
+        set_blocks=lambda *args, **kwargs: None,
+        set_zones=lambda *args, **kwargs: None,
+        set_selected_blocks=lambda *args, **kwargs: None,
+    )
+    return window
+
+
+def test_finishing_a_selection_exports_only_its_blocks(tmp_path):
+    """Selection is the article: the export holds exactly the selected lines."""
+
+    document = _stacked_page_document()
+    window = _finishable_window(document, tmp_path)
+    window._selected_block_ids = {"block_004", "block_005", "block_006"}
+
+    window.finish_selected_article()
+
+    segments = document.metadata["article_segments"]
+    assert [window._segment_key(segment) for segment in segments] == [
+        "block_001",
+        "block_004",
+        "block_007",
+    ]
+    exported = window._document_for_segment(window._segment_for_key("block_004"))
+    assert [block.id for block in exported.blocks] == [
+        "block_004",
+        "block_005",
+        "block_006",
+    ]
+    assert window._finished_segment_keys == ["block_004"]
+
+
+def test_finishing_a_selection_starts_the_next_article_after_it(tmp_path):
+    """The working article moves to the first line that was not selected."""
+
+    document = _stacked_page_document()
+    window = _finishable_window(document, tmp_path)
+    window._selected_block_ids = {"block_001", "block_002", "block_003"}
+
+    window.finish_selected_article()
+
+    segments = document.metadata["article_segments"]
+    assert [window._segment_key(segment) for segment in segments] == ["block_001", "block_004"]
+    assert window._current_segment_key == "block_004"
+
+
+def test_finishing_a_selection_locks_exactly_those_blocks(tmp_path):
+    """Only the exported lines are locked; neighbours stay editable."""
+
+    document = _stacked_page_document()
+    window = _finishable_window(document, tmp_path)
+    window._selected_block_ids = {"block_004", "block_005"}
+
+    window.finish_selected_article()
+
+    by_id = {block.id: block for block in document.blocks}
+    assert by_id["block_004"].metadata["article_locked"] is True
+    assert by_id["block_005"].metadata["article_locked"] is True
+    assert "article_locked" not in by_id["block_006"].metadata
+
+
+def test_a_non_contiguous_selection_is_refused(tmp_path):
+    """An article is one slice of the reading order, so a gap is not one."""
+
+    document = _stacked_page_document()
+    window = _finishable_window(document, tmp_path)
+    window._selected_block_ids = {"block_004", "block_006"}
+
+    window.finish_selected_article()
+
+    assert window._finished_segment_keys == []
+    assert document.metadata.get("article_segments", []) == []
+
+
+def test_a_refused_finish_leaves_the_articles_unsplit(tmp_path):
+    """A finish that fails validation must not leave extra splits behind."""
+
+    document = _stacked_page_document()
+    window = _finishable_window(document, tmp_path)
+    window._export_article_xml = lambda segment: (None, [SimpleNamespace(message="no title")])
+    window._selected_block_ids = {"block_004", "block_005"}
+
+    window.finish_selected_article()
+
+    assert document.metadata.get("article_segments", []) == []
+    assert window._finished_segment_keys == []
+    assert window._undo_stack == []
+
+
+def test_finishing_a_selection_refuses_locked_blocks(tmp_path):
+    """A finished article must be reopened before it can be finished again."""
+
+    document = _stacked_page_document()
+    window = _finishable_window(document, tmp_path)
+    document.blocks[3].metadata["article_locked"] = True  # block_004
+    window._selected_block_ids = {"block_004", "block_005"}
+
+    window.finish_selected_article()
+
+    assert window._finished_segment_keys == []
+
+
+def _detected_document() -> Document:
+    """A two-article PDF whose boundaries were only *detected*, not confirmed."""
+
+    extractor = PDFExtractor(use_docling=False)
+    blocks = [
+        _block("(S100) First paper", block_id="block_001", column=0, metadata={"reading_order": 1}),
+        _block("First body.", block_id="block_002", column=0, metadata={"reading_order": 2}),
+        _block("(S200) Second paper", block_id="block_003", column=1, metadata={"reading_order": 3}),
+        _block("Second body.", block_id="block_004", column=1, metadata={"reading_order": 4}),
+    ]
+    markers = extractor._extract_abstract_numbers(blocks)
+    segments = extractor._build_article_segments(markers, page_count=1)
+    return Document(blocks=blocks, raw_blocks=list(blocks), metadata={"article_segments": segments})
+
+
+def test_detected_articles_need_confirmation_before_export():
+    """Detection is a suggestion: unconfirmed articles must not be exported."""
+
+    document = _detected_document()
+    window = _window(document)
+    segments = document.metadata["article_segments"]
+
+    assert len(segments) == 2
+    assert window._exportable_segments(segments) == []
+
+
+def test_finishing_a_detected_article_confirms_it_for_export():
+    """Finishing an article vouches for the boundary detection suggested."""
+
+    document = _detected_document()
+    window = _window(document)
+    segments = document.metadata["article_segments"]
+    window._finished_segment_keys = [window._segment_key(segments[0])]
+
+    exportable = window._exportable_segments(segments)
+    assert [segment["abstract_number"] for segment in exportable] == ["S100"]
+
+
+def test_a_hand_made_cut_confirms_both_neighbours():
+    """Where an article starts also settles where the previous one ends."""
+
+    document = _stacked_page_document()
+    window = _window(document)
+    window.split_article_at_block("block_004")
+
+    segments = document.metadata["article_segments"]
+    exportable = window._exportable_segments(segments)
+    assert [window._segment_key(segment) for segment in exportable] == ["block_001", "block_004"]
+
+
+def test_a_pdf_without_real_segmentation_exports_as_one_article():
+    """One article has no boundary to confirm, so it is not held back."""
+
+    document = _stacked_page_document()
+    window = _window(document)
+    segments = [
+        {"index": 1, "abstract_number": "ABSN", "start_page": 1, "end_page": 1, "columns": None}
+    ]
+
+    assert window._exportable_segments(segments) == segments
+
+
+def test_a_deleted_unconfirmed_article_stays_out_of_the_export():
+    """Deleting removes an article even after its boundary was confirmed."""
+
+    document = _stacked_page_document()
+    window = _window(document)
+    window.split_article_at_block("block_004")
+    window.delete_article(document.metadata["article_segments"][0])
+
+    exportable = window._exportable_segments(document.metadata["article_segments"])
+    assert [window._segment_key(segment) for segment in exportable] == ["block_004"]
+
+
+def test_role_assignment_applies_to_a_multi_block_selection():
+    """A selection is assigned its roles before it is finished."""
+
+    document = _stacked_page_document()
+    window = _headless_window(document)
+    window.props = SimpleNamespace(role_editor=SimpleNamespace(currentText=lambda: "abstract"))
+    window._selected_block_ids = {"block_002", "block_003"}
+
+    window.apply_selected_block_role()
+
+    by_id = {block.id: block for block in document.blocks}
+    assert by_id["block_002"].role == "abstract"
+    assert by_id["block_003"].role == "abstract"
+    assert by_id["block_001"].role != "abstract"

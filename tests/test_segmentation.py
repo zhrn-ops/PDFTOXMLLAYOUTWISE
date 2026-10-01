@@ -414,3 +414,75 @@ def test_block_ids_of_returns_the_blocks_of_the_containing_article():
     assert segmentation.block_ids_of("b5") == ("b4", "b5")
     assert segmentation.block_ids_of("ghost") == ()
     assert segmentation.article_position("b6") == 2
+
+
+def test_set_deleted_flags_one_article_and_keeps_the_partition():
+    """Deleting hides an article from exports, it must not unown its blocks."""
+
+    blocks, segments = _stacked_document()
+    segmentation = Segmentation.from_legacy_segments(blocks, segments)
+
+    assert segmentation.set_deleted("b4", True) is True
+    assert segmentation.is_deleted("b4") is True
+    assert segmentation.is_deleted("b5") is True
+    assert segmentation.is_deleted("b2") is False
+    assert segmentation.is_deleted("ghost") is False
+    # The boundary stays, so every block keeps exactly one owner.
+    assert segmentation.validate(blocks) == []
+    assert [boundary.block_id for boundary in segmentation.boundaries] == ["b0", "b4", "b6"]
+
+
+def test_set_deleted_is_idempotent_and_reversible():
+    blocks, segments = _stacked_document()
+    segmentation = Segmentation.from_legacy_segments(blocks, segments)
+
+    assert segmentation.set_deleted("b0", True) is True
+    assert segmentation.set_deleted("b0", True) is False
+    assert segmentation.set_deleted("b0", False) is True
+    assert segmentation.set_deleted("b0", False) is False
+    assert segmentation.is_deleted("b0") is False
+
+
+def test_a_deleted_article_survives_the_legacy_round_trip():
+    """Deleting is per-article state, so rendering must carry it."""
+
+    blocks, segments = _stacked_document()
+    segmentation = Segmentation.from_legacy_segments(blocks, segments)
+    segmentation.set_deleted("b4", True)
+
+    rendered = segmentation.to_legacy_segments(blocks)
+    assert [bool(segment["deleted"]) for segment in rendered] == [False, True, False]
+
+    again = Segmentation.from_legacy_segments(blocks, rendered)
+    assert [boundary.deleted for boundary in again.boundaries] == [False, True, False]
+    assert again.is_deleted("b5") is True
+
+
+def test_a_deleted_article_can_be_merged_away_and_rename_keeps_deletion():
+    """Structural edits must not silently resurrect a deleted article."""
+
+    blocks, segments = _stacked_document()
+    segmentation = Segmentation.from_legacy_segments(blocks, segments)
+    segmentation.set_deleted("b4", True)
+
+    # Merging the deleted article into its neighbour drops the boundary with it.
+    assert segmentation.remove_boundary("b4") is True
+    assert segmentation.is_deleted("b3") is False
+
+    # Renaming a deleted article keeps its deleted flag.
+    segmentation2 = Segmentation.from_legacy_segments(blocks, segments)
+    segmentation2.set_deleted("b4", True)
+    assert segmentation2.set_number("b5", "P-999") is True
+    assert segmentation2.number_of("b5") == "P-999"
+    assert segmentation2.is_deleted("b5") is True
+
+
+def test_to_dict_round_trips_a_deleted_boundary():
+    blocks, segments = _stacked_document()
+    segmentation = Segmentation.from_legacy_segments(blocks, segments)
+    segmentation.set_deleted("b6", True)
+
+    restored = Segmentation.from_dict(segmentation.to_dict())
+    assert restored is not None
+    assert [boundary.deleted for boundary in restored.boundaries] == [False, False, True]
+    assert restored.is_deleted("b7") is True

@@ -14,6 +14,10 @@ Detection and a hand-made split therefore speak the same language: both insert a
 boundary at a block. :meth:`Segmentation.from_legacy_segments` translates the
 existing ``article_segments`` dicts into that form, reporting every place where
 the legacy answer was not a clean partition instead of hiding it.
+
+An article can also be flagged deleted: a false detection (an advertisement,
+boilerplate) that would export garbage. Deleting keeps the boundary so its
+blocks stay owned and visible, and every export path drops deleted articles.
 """
 
 from __future__ import annotations
@@ -230,6 +234,7 @@ class ArticleBoundary:
     source: str = SOURCE_AUTO
     number: str = ""
     marker_block_id: str = ""
+    deleted: bool = False
 
     @property
     def is_manual(self) -> bool:
@@ -245,6 +250,7 @@ class ArticleBoundary:
             "source": self.source,
             "number": self.number,
             "marker_block_id": self.marker_block_id,
+            "deleted": self.deleted,
         }
 
     @classmethod
@@ -266,6 +272,7 @@ class ArticleBoundary:
             source=source,
             number=str(data.get("number") or ""),
             marker_block_id=str(data.get("marker_block_id") or ""),
+            deleted=bool(data.get("deleted")),
         )
 
 
@@ -387,6 +394,7 @@ class Segmentation:
                     source=source,
                     number=str(segment.get("abstract_number") or "").strip(),
                     marker_block_id=str(segment.get("abstract_number_block_id") or ""),
+                    deleted=bool(segment.get("deleted")),
                 )
             )
         repeated = sorted({index for index in runs if runs.count(index) > 1})
@@ -485,6 +493,34 @@ class Segmentation:
         """The number of every article, in reading order."""
 
         return tuple(boundary.number for boundary in self.boundaries)
+
+    def is_deleted(self, block_id: str) -> bool:
+        """Whether the article a block belongs to was flagged deleted."""
+
+        article = self.article_position(block_id)
+        return article is not None and self.boundaries[article].deleted
+
+    def set_deleted(self, block_id: str, deleted: bool) -> bool:
+        """Flag or unflag the article a block belongs to as deleted.
+
+        The boundary itself stays: its blocks must remain owned and visible on
+        the page, only the export skips them.
+        """
+
+        article = self.article_position(block_id)
+        if article is None:
+            return False
+        current = self.boundaries[article]
+        if current.deleted == deleted:
+            return False
+        self.boundaries[article] = ArticleBoundary(
+            block_id=current.block_id,
+            source=current.source,
+            number=current.number,
+            marker_block_id=current.marker_block_id,
+            deleted=deleted,
+        )
+        return True
 
     def article_position(self, block_id: str) -> int | None:
         """Return the 0-based article a block belongs to, or ``None`` if unknown."""
@@ -626,6 +662,7 @@ class Segmentation:
             source=current.source,
             number=str(number),
             marker_block_id=current.marker_block_id,
+            deleted=current.deleted,
         )
         return True
 
@@ -674,6 +711,7 @@ class Segmentation:
                 "abstract_number_block_id": boundary.marker_block_id,
                 "columns": list(columns) if columns else None,
                 "boundary_source": boundary.source,
+                "deleted": boundary.deleted,
             }
             start_order = reading_order(subset[0])
             end_order = reading_order(subset[-1])

@@ -356,6 +356,7 @@ class PDFViewer(QWidget):
         self._regions: list[dict[str, Any]] = []
         self._selected_block_id: str | None = None
         self._selected_block_ids: set[str] = set()
+        self._deleted_block_ids: set[str] = set()
         self._selected_zone_id: str | None = None
         self._selected_zone_ids: set[str] = set()
         self._draft_zone_rect: list[float] | None = None
@@ -443,6 +444,14 @@ class PDFViewer(QWidget):
         if self._doc is not None:
             self.render_page(self._page_index)
 
+    def set_deleted_block_ids(self, block_ids: set[str]) -> None:
+        """Blocks of deleted articles, drawn dotted and faint until cleared."""
+
+        changed = block_ids != self._deleted_block_ids
+        self._deleted_block_ids = set(block_ids)
+        if changed and self._doc is not None:
+            self.render_page(self._page_index)
+
     def set_selected_blocks(self, block_ids: set[str], primary_block_id: str | None = None) -> None:
         """Update highlighted selected blocks and optionally jump to the primary block."""
 
@@ -495,6 +504,8 @@ class PDFViewer(QWidget):
         multi_selected_pen = QPen(QColor(37, 99, 235), 3)
         locked_pen = QPen(QColor(130, 130, 130), 2, Qt.DashLine)
         locked_selected_pen = QPen(QColor(160, 160, 160), 3, Qt.DashLine)
+        deleted_pen = QPen(QColor(120, 120, 120), 2, Qt.DotLine)
+        deleted_fill = QColor(110, 110, 110, 40)
         zone_pen = QPen(QColor(245, 158, 11), 2, Qt.DashLine)
         selected_zone_pen = QPen(QColor(234, 88, 12), 3)
         draft_pen = QPen(QColor(168, 85, 247), 2, Qt.DotLine)
@@ -509,7 +520,16 @@ class PDFViewer(QWidget):
             scaled = fitz.Rect(rect.x0 * self._page_scale, rect.y0 * self._page_scale, rect.x1 * self._page_scale, rect.y1 * self._page_scale)
             block_id = str(block.get("id"))
             block_locked = bool((block.get("metadata") or {}).get("article_locked"))
-            if block_locked:
+            if (
+                block_id in self._deleted_block_ids
+                and block_id not in self._selected_block_ids
+                and block_id != self._selected_block_id
+            ):
+                # A deleted article's blocks stay visible but recede: dotted
+                # outline and a faint fill, so they read as present-but-skipped.
+                painter.setPen(deleted_pen)
+                painter.setBrush(deleted_fill)
+            elif block_locked:
                 painter.setPen(locked_selected_pen if block_id in self._selected_block_ids or block_id == self._selected_block_id else locked_pen)
             elif block_id == self._selected_block_id:
                 painter.setPen(selected_pen)

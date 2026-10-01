@@ -107,6 +107,7 @@ class MainWindow(QMainWindow):
         self._review_block_ids: list[str] = []
         self._review_index = -1
         self._finished_segment_keys: list[str] = []
+        self._deleted_segment_keys: list[str] = []
         self._current_segment_key: str | None = None
         # Cached article identities, held together with the block and segment
         # lists they were computed from so a replaced list invalidates them.
@@ -159,6 +160,12 @@ class MainWindow(QMainWindow):
             "Extract, classify, auto-refine, and export XML to the default folder in one click."
         )
         auto_pipeline_btn.clicked.connect(self.run_auto_pipeline)
+        self.finish_selection_btn = QPushButton("Finish Selection")
+        self.finish_selection_btn.setToolTip(
+            "Export the selected lines as one article, lock them, and start the\n"
+            "next article at the first line you did not select (Ctrl+Return)."
+        )
+        self.finish_selection_btn.clicked.connect(self.finish_selected_article)
         review_btn = QPushButton("Next Review Item")
         review_btn.setToolTip("Jump to the next block the auto-refiner flagged for review.")
         review_btn.clicked.connect(self.goto_next_review_item)
@@ -172,6 +179,7 @@ class MainWindow(QMainWindow):
             xml_btn,
             json_btn,
             auto_pipeline_btn,
+            self.finish_selection_btn,
             review_btn,
             self.finish_article_btn,
             self.reopen_article_btn,
@@ -282,6 +290,10 @@ class MainWindow(QMainWindow):
         # reachable from the keyboard as well as by button and right-click.
         self.split_shortcut = QShortcut(QKeySequence("Ctrl+Shift+N"), self)
         self.split_shortcut.activated.connect(self.split_article_at_selection)
+        # Finishing one article and starting the next is the whole multi-article
+        # loop, so it is reachable without leaving the keyboard.
+        self.finish_selection_shortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
+        self.finish_selection_shortcut.activated.connect(self.finish_selected_article)
         # Processing a PDF of several articles is mostly a sequence of articles,
         # so stepping to the next one should not require aiming at a tab.
         self.next_article_shortcut = QShortcut(QKeySequence("Alt+Right"), self)
@@ -330,11 +342,19 @@ class MainWindow(QMainWindow):
         )
         self.merge_segments_btn.setEnabled(False)
         self.merge_segments_btn.clicked.connect(self.merge_selected_segments)
+        self.delete_article_btn = QPushButton("Delete Article")
+        self.delete_article_btn.setToolTip(
+            "Keep the current article visible but leave it out of every export.\n"
+            "Right-click its tab and choose Restore to export it again. Ctrl+Z undoes."
+        )
+        self.delete_article_btn.setEnabled(False)
+        self.delete_article_btn.clicked.connect(self.delete_current_article)
         articles_layout.addWidget(self.articles_hint)
         articles_layout.addWidget(self.articles_tabs, 1)
         articles_layout.addWidget(self.split_segment_btn)
         articles_layout.addWidget(self.merge_previous_btn)
         articles_layout.addWidget(self.merge_segments_btn)
+        articles_layout.addWidget(self.delete_article_btn)
 
         selected_column = QWidget()
         selected_layout = QVBoxLayout(selected_column)
@@ -512,24 +532,28 @@ class MainWindow(QMainWindow):
         if validation_errors:
             for error in validation_errors:
                 self._log(f"Document validation error: {error.message}")
-        segments = [
-            segment
-            for segment in export_document.metadata.get("article_segments", [])
-            if self._segment_key(segment) not in self._finished_segment_keys
-        ]
-        if not segments and self._finished_segment_keys:
-            self._log("All detected articles are finished; nothing left to export.")
+        all_segments = list(export_document.metadata.get("article_segments", []))
+        segments = self._exportable_segments(all_segments)
+        if not segments and all_segments:
+            # Every detected article is deleted or still only a suggestion, and a
+            # suggestion is never written out. Exporting the whole document here
+            # would resurrect exactly the articles the user has not vouched for.
+            self._log(
+                "No article is ready to export: every detected article is deleted or "
+                "still only a suggestion."
+            )
             QMessageBox.information(
                 self,
-                "All articles finished",
-                "Every detected article has been finished. Reopen an article to re-export it.",
+                "Nothing to export",
+                "Detection is only a suggestion. Finish an article, or build one from "
+                "a selection, before exporting. Deleted articles are always left out.",
             )
             return
         documents = [self._document_for_segment(segment, export_document) for segment in segments]
-        if len(documents) <= 1 and len(export_document.metadata.get("article_segments", [])) <= 1:
-            # Single-article PDFs (or PDFs with no detected segments) keep the
-            # whole-document export; multi-article PDFs export per segment so
-            # finished articles are not re-exported.
+        if len(documents) <= 1 and len(all_segments) <= 1 and not self._deleted_segment_keys:
+            # A PDF with at most one article (or no detected segments at all) has
+            # no boundary to confirm, so it keeps the whole-document export. A
+            # deleted article must never leak back through this fallback.
             documents = [export_document]
         output_dir = self._choose_output_directory(
             "Choose XML output folder", self.config.generated_xml_dir
@@ -627,13 +651,18 @@ class MainWindow(QMainWindow):
         validation_errors = self.validator.validate_document(export_document)
         for error in validation_errors:
             self._log(f"Document validation error: {error.message}")
-        segments = [
-            segment
-            for segment in export_document.metadata.get("article_segments", [])
-            if self._segment_key(segment) not in self._finished_segment_keys
-        ]
+        all_segments = list(export_document.metadata.get("article_segments", []))
+        segments = self._exportable_segments(all_segments)
         if segments:
             documents = [self._document_for_segment(segment, export_document) for segment in segments]
+        elif all_segments:
+            # Detected articles that are deleted or still only suggestions must
+            # not leak back in through a whole-document export.
+            documents = []
+            self._log(
+                "No article is ready to export: finish an article or build one from a "
+                "selection, then run the pipeline again."
+            )
         else:
             documents = [export_document]
         output_dir = self.config.generated_xml_dir
@@ -794,6 +823,9 @@ class MainWindow(QMainWindow):
             ".finished{border:1px dashed #8a8a8a;background:#232323;color:#8f8f8f;}"
             ".finished.selected{border:2px dashed #a0a0a0;background:#2a2a2a;color:#c0c0c0;}"
             ".finished.continued{border:2px dashed #8a8a8a;background:#232323;color:#8f8f8f;}"
+            ".deleted{border:1px dotted #7a4a4a;background:#241d1d;color:#7d6b6b;}"
+            ".deleted.selected{border:2px dotted #a06a6a;background:#2d2020;color:#9a8a8a;}"
+            ".deleted.continued{border:2px dotted #7a4a4a;background:#241d1d;color:#7d6b6b;}"
             ".meta{color:#bdbdbd;font-size:11px;}</style>"
             "<h3>Reading Order Preview</h3>"
         ]
@@ -826,18 +858,20 @@ class MainWindow(QMainWindow):
                 bool((blocks_by_id_all.get(block_id) is not None) and (blocks_by_id_all[block_id].metadata or {}).get("article_locked"))
                 for block_id in block_ids
             )
-            lock_prefix = "🔒 " if item_locked else ""
+            item_deleted = any(block_id in self._deleted_view_block_ids for block_id in block_ids)
+            delete_prefix = "✕ " if item_deleted else ""
+            lock_prefix = f"{delete_prefix}🔒 " if item_locked else delete_prefix
             if len(block_ids) == 1:
                 anchor = f"block-{block_ids[0]}"
                 label = (
                     f'<a name="{escape(anchor)}"></a><a href="select:{escape(block_ids[0])}">'
                     f'<span class="meta">{lock_prefix}{index}. page {page} | {escape(role)}</span></a>'
                 )
-                css_class = ("finished " if item_locked else "") + selected
+                css_class = ("deleted " if item_deleted else "finished " if item_locked else "") + selected
             else:
                 anchor = f"continued-{'-'.join(block_ids)}"
                 label = f'<a name="{escape(anchor)}"></a><span class="meta">{lock_prefix}CONTINUED | {index}. page {page} | {escape(role)}</span>'
-                css_class = ("finished " if item_locked else "") + f"continued{selected}"
+                css_class = ("deleted " if item_deleted else "finished " if item_locked else "") + f"continued{selected}"
             parts.append(
                 f'<p class="{css_class}">{label}'
                 f'<br>{escape(text)}</p>'
@@ -884,7 +918,6 @@ class MainWindow(QMainWindow):
             return []
         segments = self.document.metadata.get("article_segments", [])
         return [segment for segment in segments if isinstance(segment, dict)]
-
     @staticmethod
     def _segment_locator(segment: dict[str, object]) -> tuple:
         """Value fingerprint used to recognize a segment dict across copies.
@@ -954,9 +987,13 @@ class MainWindow(QMainWindow):
                 if key == self._current_segment_key:
                     return segment, key
             return None
-        # Fall back to the first segment that is not finished yet.
+        # Fall back to the first segment that is neither finished nor deleted,
+        # so working state lands on an article an export would still produce.
         for segment, key in self._segments_with_keys():
-            if key not in self._finished_segment_keys:
+            if (
+                key not in self._finished_segment_keys
+                and key not in self._deleted_segment_keys
+            ):
                 return segment, key
         return None
 
@@ -982,7 +1019,10 @@ class MainWindow(QMainWindow):
         self._update_document_model()
         self.viewer.set_blocks([asdict(block) for block in self.document.blocks])
         self.viewer.set_zones([asdict(zone) for zone in self.document.zones])
+        self._sync_deleted_block_overlay()
         self._populate_tree()
+        self._sync_tree_selection()
+        self._update_selection_status()
         self._update_html_preview()
         self._update_selection_panel()
         self._refresh_article_buttons()
@@ -1025,6 +1065,8 @@ class MainWindow(QMainWindow):
         self._current_segment_key = self._segment_key(target)
         self._refresh_article_buttons()
         self.viewer.render_page(max(0, int(target.get("start_page", 1)) - 1))
+        # Keep the Selected Blocks panel on the article being stepped through.
+        self._refresh_selected_blocks_view()
         number = str(target.get("abstract_number", "")).strip() or "ABSN"
         self._notify(
             f"Working on article {target.get('index', '?')} of {len(segments)} "
@@ -1091,6 +1133,7 @@ class MainWindow(QMainWindow):
                 "before": [dict(segment) for segment in self._document_segments()],
                 "current_key": getattr(self, "_current_segment_key", None),
                 "finished_keys": list(getattr(self, "_finished_segment_keys", [])),
+                "deleted_keys": list(getattr(self, "_deleted_segment_keys", [])),
             }
         )
 
@@ -1117,6 +1160,7 @@ class MainWindow(QMainWindow):
                 source=boundary.source,
                 number=number,
                 marker_block_id=block.id,
+                deleted=boundary.deleted,
             )
 
     def _report_segmentation_issues(self, segmentation: Segmentation) -> None:
@@ -1187,6 +1231,26 @@ class MainWindow(QMainWindow):
             return f"article_{index:03d}.xml"
         return "article.xml"
 
+    def _lock_blocks(self, blocks, key: str | None) -> int:
+        """Flag the given blocks as belonging to a finished article.
+
+        Locking is per block, so a selection-based finish can lock exactly the
+        lines the user exported instead of every role-carrying line of a range.
+        """
+
+        locked_count = 0
+        for block in blocks:
+            metadata = dict(block.metadata)
+            if metadata.get("article_locked"):
+                continue
+            metadata["article_locked"] = True
+            block.metadata.clear()
+            block.metadata.update(metadata)
+            locked_count += 1
+        if key is not None and key not in self._finished_segment_keys:
+            self._finished_segment_keys.append(key)
+        return locked_count
+
     def _lock_segment_blocks(self, segment: dict[str, object], key: str | None) -> int:
         """Lock the worked-on fields (title, authors, affiliations, abstract).
 
@@ -1197,23 +1261,13 @@ class MainWindow(QMainWindow):
 
         if self.document is None:
             return 0
-        locked_count = 0
-        for block in self.document.blocks:
-            if not block_matches_segment(block, segment):
-                continue
-            if block.role not in REFINE_ROLES:
-                continue
-            metadata = dict(block.metadata)
-            if metadata.get("article_locked"):
-                continue
-            metadata["article_locked"] = True
-            block.metadata.clear()
-            block.metadata.update(metadata)
-            locked_count += 1
-        # A segment that owns no block of its own has no identity to lock.
-        if key is not None and key not in self._finished_segment_keys:
-            self._finished_segment_keys.append(key)
-        return locked_count
+        role_blocks = [
+            block
+            for block in self.document.blocks
+            if block_matches_segment(block, segment) and block.role in REFINE_ROLES
+        ]
+        # A segment that owns no block of its own still has an identity to lock.
+        return self._lock_blocks(role_blocks, key)
 
     def _unlock_segment_blocks(self, segment: dict[str, object], key: str | None) -> int:
         """Remove the finished/locked state from a segment's blocks."""
@@ -1251,6 +1305,9 @@ class MainWindow(QMainWindow):
         if key in self._finished_segment_keys:
             self._notify("This article is already finished.")
             return
+        if key in self._deleted_segment_keys:
+            self._notify("This article is deleted; restore it before finishing it.")
+            return
         confirm = QMessageBox.question(
             self,
             "Finish article",
@@ -1264,14 +1321,14 @@ class MainWindow(QMainWindow):
         )
         if confirm != QMessageBox.Yes:
             return
-        output_dir = self.config.generated_xml_dir
-        output_dir.mkdir(parents=True, exist_ok=True)
         # A full document can validate while this detected article is missing
-        # content. Validate the segment before writing or locking it.
-        self._update_document_model()
-        export_document = self._document_with_html_preview_continuations()
-        segment_document = self._document_for_segment(segment, export_document)
-        validation_errors = self.validator.validate_document(segment_document)
+        # content. Validate the segment before writing or locking it, so both
+        # finish paths share one gate.
+        try:
+            generated_path, validation_errors = self._export_article_xml(segment)
+        except Exception as exc:
+            QMessageBox.critical(self, "Export failed", f"The article XML could not be written: {exc}")
+            return
         if validation_errors:
             messages = "\n".join(f"• {error.message}" for error in validation_errors)
             self._log(
@@ -1284,11 +1341,6 @@ class MainWindow(QMainWindow):
                 "The article was not exported or locked because it is incomplete:\n\n" + messages,
             )
             return
-        try:
-            generated_path = self._export_segment_document(segment, output_dir)
-        except Exception as exc:
-            QMessageBox.critical(self, "Export failed", f"The article XML could not be written: {exc}")
-            return
         locked_count = self._lock_segment_blocks(segment, key)
         self._current_segment_key = self._next_unfinished_segment_key()
         self._refresh_after_article_change()
@@ -1300,6 +1352,183 @@ class MainWindow(QMainWindow):
         self._notify(
             f"Finished article {segment.get('abstract_number', '')}: exported "
             f"{generated_path.name}; locked {locked_count} block(s)."
+        )
+
+    def _export_article_xml(self, segment: dict[str, object]) -> tuple[Path | None, list]:
+        """Validate and write one article's XML, without any dialogs.
+
+        Returns the written path and the validation errors. An article with
+        errors is never written, which is the gate both finish actions share.
+        """
+
+        self._update_document_model()
+        export_document = self._document_with_html_preview_continuations()
+        segment_document = self._document_for_segment(segment, export_document)
+        validation_errors = self.validator.validate_document(segment_document)
+        if validation_errors:
+            return None, validation_errors
+        output_dir = self.config.generated_xml_dir
+        output_dir.mkdir(parents=True, exist_ok=True)
+        return self._export_segment_document(segment, output_dir), []
+
+    def _selected_contiguous_run(self) -> list | None:
+        """Return the selected blocks when they form one run in reading order.
+
+        Finishing a selection turns it into an article, and an article is a slice
+        of the reading stream. A selection with a gap between two lines is not one
+        slice, so it is refused here rather than exported with a hole in it.
+        """
+
+        if self.document is None:
+            self._notify("Load a PDF first.")
+            return None
+        if not self._selected_block_ids:
+            self._notify("Select the lines that make up the article first.")
+            return None
+        ordered = self._ensure_reading_orders()
+        positions = {block.id: index for index, block in enumerate(ordered)}
+        if not set(self._selected_block_ids).issubset(positions):
+            self._notify("The selection refers to a block that is no longer in the document.")
+            return None
+        selected = [block for block in ordered if block.id in self._selected_block_ids]
+        first = positions[selected[0].id]
+        if [positions[block.id] for block in selected] != list(range(first, first + len(selected))):
+            self._notify(
+                "Select a contiguous run of lines: finishing an article exports one "
+                "slice of the reading order, not scattered lines."
+            )
+            return None
+        locked = self._locked_selection_blocks(selected)
+        if locked:
+            self._warn_locked_blocks(locked)
+            return None
+        return selected
+
+    def _create_article_from_selection(self, selected: list) -> str | None:
+        """Bound the selected run as an article and return the block that starts it.
+
+        Two boundaries express the cut: one starts the article at the selection's
+        first line, and one starts the article after it at the first line that was
+        not selected. Detection is only a suggestion, so this overrides whichever
+        article happened to own those lines before.
+        """
+
+        if self.document is None:
+            return None
+        ordered = self._ensure_reading_orders()
+        segmentation = self._article_segmentation(ordered)
+        if segmentation is None:
+            return None
+        ids = [block.id for block in ordered]
+        positions = {block_id: index for index, block_id in enumerate(ids)}
+        first_position = positions[selected[0].id]
+        last_position = positions[selected[-1].id]
+        self._push_article_undo("finish selection")
+        if first_position > 0:
+            segmentation.insert_boundary(selected[0].id, source=SOURCE_MANUAL)
+        after_position = last_position + 1
+        if after_position < len(ids):
+            segmentation.insert_boundary(ids[after_position], source=SOURCE_MANUAL)
+        # Name each article from the marker line it starts with, when it prints one.
+        self._name_articles_from_markers(segmentation, ordered)
+        self._replace_article_segments(segmentation.to_legacy_segments(self.document.blocks))
+        self._report_segmentation_issues(segmentation)
+        self._current_segment_key = selected[0].id
+        return selected[0].id
+
+    def _rollback_article_change(self, snapshot: dict[str, object] | None) -> None:
+        """Put the articles back after a finish that was refused.
+
+        A finish that fails validation or export must not leave the boundary edit
+        it made behind: the selection is not an article yet, so the snapshot taken
+        just before the boundaries were written is restored in place.
+        """
+
+        if not snapshot or self.document is None:
+            return
+        stack = getattr(self, "_undo_stack", None)
+        if stack and stack[-1] is snapshot:
+            stack.pop()
+        before = snapshot.get("before")
+        if not isinstance(before, list):
+            return
+        self.document.metadata["article_segments"] = [
+            dict(segment) for segment in before if isinstance(segment, dict)
+        ]
+        self._invalidate_segment_identity()
+        self._finished_segment_keys = [str(key) for key in (snapshot.get("finished_keys") or [])]
+        self._deleted_segment_keys = [str(key) for key in (snapshot.get("deleted_keys") or [])]
+        known = {key for key in self._segment_boundary_ids() if key}
+        current_key = snapshot.get("current_key")
+        self._current_segment_key = str(current_key) if current_key in known else None
+
+    def finish_selected_article(self) -> None:
+        """Export exactly the selected lines as an article, lock them, and move on.
+
+        Selection is the primary way an article is defined: pick the run of lines
+        that makes up one paper, assign their roles, and finish it. Detection is
+        only a suggestion; the exported article is the selection itself, and the
+        next article starts at the first line that was not selected.
+        """
+
+        if self.document is None:
+            self._notify("Load a PDF first.")
+            return
+        selected = self._selected_contiguous_run()
+        if selected is None:
+            return
+        stack = getattr(self, "_undo_stack", None)
+        depth = len(stack) if stack is not None else 0
+        key = self._create_article_from_selection(selected)
+        snapshot = stack[-1] if stack and len(stack) > depth else None
+        segment = self._segment_for_key(key) if key else None
+        if segment is None:
+            self._rollback_article_change(snapshot)
+            self._notify("The selection could not be turned into an article.")
+            return
+        try:
+            generated_path, validation_errors = self._export_article_xml(segment)
+        except Exception as exc:
+            self._rollback_article_change(snapshot)
+            self._notify(f"The article XML could not be written: {exc}")
+            return
+        if validation_errors:
+            # A refused finish must not leave extra article splits behind.
+            self._rollback_article_change(snapshot)
+            self._log(
+                f"Cannot finish article {segment.get('abstract_number', '')}: "
+                f"{'; '.join(error.message for error in validation_errors)}"
+            )
+            for error in validation_errors:
+                self._log(f"Article validation error: {error.message}")
+            self._notify(
+                "The selection was not exported or locked because the article is "
+                "incomplete; assign roles to the missing fields and finish again."
+            )
+            return
+        locked_count = self._lock_blocks(selected, key)
+        # The next article starts at the first line that was not selected, so the
+        # working article follows the selection instead of jumping back to the top.
+        ordered = self._ensure_reading_orders()
+        ids = [block.id for block in ordered]
+        position = ids.index(selected[-1].id)
+        following_key = ids[position + 1] if position + 1 < len(ids) else None
+        self._current_segment_key = following_key or self._next_unfinished_segment_key()
+        self._refresh_after_article_change()
+        following = self._segment_for_key(self._current_segment_key)
+        viewer = getattr(self, "viewer", None)
+        if following is not None and viewer is not None:
+            viewer.render_page(max(0, int(following.get("start_page", 1)) - 1))
+        number = str(segment.get("abstract_number", "")).strip() or "ABSN"
+        exported_name = generated_path.name if generated_path is not None else ""
+        where = (
+            f"next article starts on page {following.get('start_page')}."
+            if following is not None
+            else "the selection was the last article in the document."
+        )
+        self._notify(
+            f"Finished article {number}: exported {exported_name}; locked "
+            f"{locked_count} block(s); {where}"
         )
 
     def reopen_current_article(self) -> None:
@@ -1354,9 +1583,191 @@ class MainWindow(QMainWindow):
 
     def _next_unfinished_segment_key(self) -> str | None:
         for _segment, key in self._segments_with_keys():
-            if key not in self._finished_segment_keys:
+            if (
+                key not in self._finished_segment_keys
+                and key not in self._deleted_segment_keys
+            ):
                 return key
         return None
+
+    def _is_segment_deleted(self, segment: dict[str, object]) -> bool:
+        """Whether an article is deleted, by key or its stored boundary flag."""
+
+        return (
+            self._segment_key(segment) in self._deleted_segment_keys
+            or bool(segment.get("deleted"))
+        )
+
+    def _sync_deleted_block_overlay(self) -> None:
+        """Mirror the deleted articles on the page overlay."""
+
+        viewer = getattr(self, "viewer", None)
+        if viewer is not None:
+            viewer.set_deleted_block_ids(self._deleted_view_block_ids)
+
+    @property
+    def _deleted_view_block_ids(self) -> frozenset[str]:
+        """Blocks of deleted articles, for the page overlay and HTML preview.
+
+        Membership is resolved through the boundary model rather than stored, so
+        the set survives splits and merges exactly like the finish/restore
+        bookkeeping does.
+        """
+
+        if self.document is None or not self._deleted_segment_keys:
+            return frozenset()
+        deleted = set(self._deleted_segment_keys)
+        return frozenset(
+            block.id
+            for segment, key in self._segments_with_keys()
+            if key in deleted
+            for block in self.document.blocks
+            if block_matches_segment(block, segment)
+        )
+
+    def _segment_has_manual_boundary(self, segment: dict[str, object]) -> bool:
+        """Whether an article's start boundary was drawn by hand."""
+
+        declared = str(segment.get("boundary_source") or "").strip()
+        if declared:
+            return declared == SOURCE_MANUAL
+        # Legacy dicts predate boundary_source; reading-order bounds there are
+        # the sign of a hand-made cut.
+        return segment_is_manual(segment)
+
+    def _segment_is_confirmed(
+        self,
+        segment: dict[str, object],
+        segments: list[dict[str, object]],
+        index: int,
+    ) -> bool:
+        """Whether the user has vouched for an article boundary.
+
+        Detection only suggests boundaries, and a suggestion must not be
+        exported: a proceedings PDF would dump every guessed article into the
+        output before anyone read it. An article is confirmed once the user
+        finishes it or cuts it by hand. A hand-made cut confirms both neighbours,
+        because deciding that a new article starts there also settles where the
+        previous one ends.
+        """
+
+        key = self._segment_key(segment)
+        if key is not None and key in self._finished_segment_keys:
+            return True
+        if self._segment_has_manual_boundary(segment):
+            return True
+        following = segments[index + 1] if index + 1 < len(segments) else None
+        return following is not None and self._segment_has_manual_boundary(following)
+
+    def _exportable_segments(self, segments: list[dict[str, object]]) -> list[dict[str, object]]:
+        """Keep the articles an export should produce.
+
+        An article exports only once the user has vouched for its boundary, by
+        finishing it or cutting it by hand. A PDF the extractor did not really
+        segment is one article and has no boundary to confirm, so it still
+        exports as a whole. Deleted articles never export.
+        """
+
+        if len(segments) <= 1:
+            return [segment for segment in segments if not self._is_segment_deleted(segment)]
+        return [
+            segment
+            for index, segment in enumerate(segments)
+            if not self._is_segment_deleted(segment)
+            and self._segment_is_confirmed(segment, segments, index)
+        ]
+
+    def delete_article(self, segment: dict[str, object] | None = None) -> bool:
+        """Drop a detected article from every export without losing its blocks.
+
+        False detections (an advertisement, publisher boilerplate) would
+        otherwise have to be finished or merged away to leave the export alone.
+        Deleting keeps the boundary, so its blocks stay owned and visible but
+        grayed, and the article reappears in exports only after a restore.
+        """
+
+        if self.document is None:
+            self._notify("Load a PDF first.")
+            return False
+        target = segment if segment is not None else (self._current_segment() or (None, None))[0]
+        if target is None:
+            self._notify("Select an article tab before deleting one.")
+            return False
+        key = self._segment_key(target)
+        if key is None:
+            self._notify("That article could not be identified; nothing was deleted.")
+            return False
+        if key in self._finished_segment_keys:
+            self._notify("Reopen the finished article before deleting it.")
+            return False
+        if key in self._deleted_segment_keys:
+            self._notify("That article is already deleted; use Restore to bring it back.")
+            return False
+        self._push_article_undo("delete article")
+        self._deleted_segment_keys.append(key)
+        self._sync_deleted_block_overlay()
+        number = str(target.get("abstract_number", "")).strip() or "ABSN"
+        self._notify(
+            f"Deleted article {number}; its blocks stay visible but will not be exported. "
+            "Right-click its tab to restore it, or press Ctrl+Z to undo."
+        )
+        self._refresh_article_buttons()
+        return True
+
+    def restore_article(self, segment: dict[str, object] | None = None) -> bool:
+        """Un-delete a deleted article so it is exported again."""
+
+        if self.document is None:
+            self._notify("Load a PDF first.")
+            return False
+        target = segment if segment is not None else (self._current_segment() or (None, None))[0]
+        if target is None:
+            self._notify("Select an article tab before restoring one.")
+            return False
+        key = self._segment_key(target)
+        if key is None or key not in self._deleted_segment_keys:
+            self._notify("That article is not deleted.")
+            return False
+        self._push_article_undo("restore article")
+        self._deleted_segment_keys.remove(key)
+        self._sync_deleted_block_overlay()
+        number = str(target.get("abstract_number", "")).strip() or "ABSN"
+        self._notify(f"Restored article {number}; it will be exported again.")
+        self._refresh_article_buttons()
+        return True
+
+    def delete_current_article(self) -> None:
+        """Delete the working article, or restore it when already deleted."""
+
+        if self.document is None:
+            self._notify("Load a PDF first.")
+            return
+        current = self._current_segment()
+        if current is None:
+            self._notify("Select an article tab before deleting or restoring one.")
+            return
+        segment, key = current
+        if key in self._deleted_segment_keys:
+            self.restore_article(segment)
+        else:
+            self.delete_article(segment)
+
+    def _refresh_delete_article_button(self, current: tuple | None = None) -> None:
+        """Mirror the working article's deleted state on the delete/restore button."""
+
+        if not hasattr(self, "delete_article_btn"):
+            return
+        if self.document is None or current is None:
+            self.delete_article_btn.setEnabled(False)
+            self.delete_article_btn.setText("Delete Article")
+            return
+        segment, key = current
+        number = str(segment.get("abstract_number", "")).strip() or "ABSN"
+        if key in self._deleted_segment_keys:
+            self.delete_article_btn.setText(f"Restore {number}")
+        else:
+            self.delete_article_btn.setText(f"Delete {number}")
+        self.delete_article_btn.setEnabled(True)
 
     def _refresh_article_buttons(self) -> None:
         """Reflect the current article state on the finish/reopen buttons."""
@@ -1365,6 +1776,7 @@ class MainWindow(QMainWindow):
             self.finish_article_btn.setEnabled(False)
             self.finish_article_btn.setText("Finish Article")
             self.reopen_article_btn.setEnabled(False)
+            self._refresh_delete_article_button(None)
             self.metadata_panel.set_abstract_number("", enabled=False)
             self.author_affiliation_review_panel.set_link_review([], [], [], enabled=False)
             self._update_split_segment_button()
@@ -1379,11 +1791,14 @@ class MainWindow(QMainWindow):
             self.metadata_panel.set_abstract_number(self.document.abstract_number())
         else:
             segment, _key = current
-            self.finish_article_btn.setEnabled(True)
+            # A deleted article is skipped by exports, so finishing it would
+            # export nothing; restoring is the way out.
+            self.finish_article_btn.setEnabled(_key not in self._deleted_segment_keys)
             abstract_number = str(segment.get("abstract_number", "")).strip()
             self.finish_article_btn.setText(f"Finish {abstract_number}" if abstract_number else "Finish Article")
             self.metadata_panel.set_abstract_number(abstract_number)
         self.reopen_article_btn.setEnabled(bool(self._finished_segment_keys))
+        self._refresh_delete_article_button(current)
         self._update_split_segment_button()
         self._refresh_link_review()
         self._refresh_articles_list()
@@ -1418,7 +1833,7 @@ class MainWindow(QMainWindow):
             page_layout.setContentsMargins(8, 8, 8, 8)
             summary = QLabel(self._segment_summary(segment))
             summary.setWordWrap(True)
-            if finished:
+            if finished or segment.get("deleted"):
                 summary.setStyleSheet("color: #9a9a9a;")
             page_layout.addWidget(summary)
             is_current = key is not None and key == self._current_segment_key
@@ -1431,10 +1846,18 @@ class MainWindow(QMainWindow):
                 )
             )
             page_layout.addWidget(
-                QLabel("Right-click this tab to name the article, merge it, or reopen it.")
+                QLabel(
+                    "Right-click this tab to name the article, merge, delete, restore, or reopen it."
+                )
             )
             index = self.articles_tabs.addTab(
-                tab_page, self._segment_tab_title(segment, finished, is_current)
+                tab_page,
+                self._segment_tab_title(
+                    segment,
+                    finished,
+                    is_current,
+                    deleted=self._is_segment_deleted(segment),
+                ),
             )
             self.articles_tabs.setTabToolTip(index, self._segment_summary(segment))
             if key == previous_key:
@@ -1456,12 +1879,13 @@ class MainWindow(QMainWindow):
                     segment
                     for segment in segments
                     if self._segment_key(segment) not in self._finished_segment_keys
+                    and not self._is_segment_deleted(segment)
                 ]
             )
             if not unfinished:
                 self.articles_hint.setText(
-                    f"All {len(segments)} articles are finished. Right-click a line in the page, "
-                    "or use Reopen Article, to change one."
+                    f"All {len(segments)} articles are finished or deleted. Right-click a line in the page, "
+                    "or use Reopen or Restore, to change one."
                 )
             else:
                 self.articles_hint.setText(
@@ -1473,11 +1897,13 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _segment_tab_title(
-        segment: dict[str, object], finished: bool, current: bool = False
+        segment: dict[str, object], finished: bool, current: bool = False, deleted: bool = False
     ) -> str:
-        """Short tab caption: article number plus finished/working markers."""
+        """Short tab caption: article number plus finished/deleted/working markers."""
 
         number = str(segment.get("abstract_number", "")).strip() or "ABSN"
+        if deleted or segment.get("deleted"):
+            return f"✕ {number}"
         if finished:
             return f"🔒 {number}"
         return f"● {number}" if current else number
@@ -1495,6 +1921,9 @@ class MainWindow(QMainWindow):
                 self._refresh_article_buttons()
         start_page = int(segment.get("start_page", 1))
         self.viewer.render_page(start_page - 1)
+        # The Selected Blocks panel follows the working article, so switching
+        # tabs re-scopes it to the article that was just chosen.
+        self._refresh_selected_blocks_view()
         self._log(
             f"Viewing article {segment.get('index')} "
             f"(ABSN {segment.get('abstract_number', '')}) from page {start_page}."
@@ -1519,16 +1948,20 @@ class MainWindow(QMainWindow):
         if key is not None:
             self._current_segment_key = key
             self._refresh_article_buttons()
+            self._refresh_selected_blocks_view()
         finished = key in self._finished_segment_keys
         number = str(segment.get("abstract_number", "")).strip() or "ABSN"
         previous_key = self._neighbour_boundary_key(key, -1)
         next_key = self._neighbour_boundary_key(key, 1)
-        mergeable = not finished
+        deleted = self._is_segment_deleted(segment)
+        mergeable = not finished and not deleted
         menu = QMenu(self)
         rename_action = menu.addAction(f"Set article number for {number}...")
         previous_action = menu.addAction("Merge into the previous article")
         next_action = menu.addAction("Merge the next article into this one")
         merge_action = menu.addAction(f"Merge {number} with another article...")
+        delete_action = menu.addAction(f"Delete {number} (keep visible, skip export)")
+        restore_action = menu.addAction(f"Restore {number} (export it again)")
         reopen_action = menu.addAction("Reopen this article") if finished else None
         previous_action.setEnabled(
             mergeable
@@ -1539,6 +1972,8 @@ class MainWindow(QMainWindow):
             mergeable and next_key is not None and next_key not in self._finished_segment_keys
         )
         merge_action.setEnabled(mergeable)
+        delete_action.setEnabled(not finished and not deleted)
+        restore_action.setEnabled(deleted)
         chosen = menu.exec(self.articles_tabs.mapToGlobal(position))
         if chosen is None:
             return
@@ -1555,6 +1990,12 @@ class MainWindow(QMainWindow):
             return
         if chosen is merge_action:
             self.merge_selected_segments()
+            return
+        if chosen is delete_action:
+            self.delete_article(segment)
+            return
+        if chosen is restore_action:
+            self.restore_article(segment)
             return
         if reopen_action is not None and chosen is reopen_action:
             self.reopen_article(segment)
@@ -1594,6 +2035,17 @@ class MainWindow(QMainWindow):
             and next_key not in self._finished_segment_keys
         )
         menu.addSeparator()
+        delete_action = menu.addAction("Delete this article (keep visible, skip export)")
+        delete_action.setEnabled(
+            starts_article
+            and segment is not None
+            and not self._is_segment_deleted(segment)
+            and self._segment_key(segment) not in self._finished_segment_keys
+        )
+        restore_action = menu.addAction("Restore this article (export it again)")
+        restore_action.setEnabled(
+            starts_article and segment is not None and self._is_segment_deleted(segment)
+        )
         number_action = menu.addAction("Set article number...")
         number_action.setEnabled(segment is not None)
         chosen = menu.exec(global_pos)
@@ -1609,6 +2061,12 @@ class MainWindow(QMainWindow):
         if chosen is next_action:
             self.merge_article_with_next(segment)
             self._refresh_article_buttons()
+            return
+        if chosen is delete_action:
+            self.delete_article(segment)
+            return
+        if chosen is restore_action:
+            self.restore_article(segment)
             return
         if chosen is number_action:
             self.set_article_number(segment)
@@ -1647,8 +2105,10 @@ class MainWindow(QMainWindow):
         previous = self._neighbour_segment(current_segment, -1)
         self.merge_previous_btn.setEnabled(
             key not in self._finished_segment_keys
+            and key not in self._deleted_segment_keys
             and previous is not None
             and self._segment_key(previous) not in self._finished_segment_keys
+            and not self._is_segment_deleted(previous)
         )
 
     def _update_split_segment_button(self) -> None:
@@ -1670,7 +2130,9 @@ class MainWindow(QMainWindow):
         pages = f"p{start}" if start == end else f"p{start}-{end}"
         columns = segment.get("columns") or []
         column_text = "" if not columns else " col" + ",".join(str(column) for column in columns)
-        state = " | finished" if self._segment_key(segment) in self._finished_segment_keys else ""
+        state = " | deleted" if self._is_segment_deleted(segment) else (
+            " | finished" if self._segment_key(segment) in self._finished_segment_keys else ""
+        )
         # The stored vocabulary reads reading-order bounds as "split by hand",
         # but the boundary model records the real origin beside them.
         boundary_source = str(segment.get("boundary_source") or "")
@@ -1794,6 +2256,7 @@ class MainWindow(QMainWindow):
         )
         self._current_segment_key = block_id
         self._report_segmentation_issues(segmentation)
+        self._refresh_selected_blocks_view()
         return self._segment_for_key(block_id)
 
     def _split_here(self, block_id: str) -> None:
@@ -1852,6 +2315,7 @@ class MainWindow(QMainWindow):
             for segment in self._document_segments()
             if self._segment_key(segment) != target_key
             and self._segment_key(segment) not in self._finished_segment_keys
+            and not self._is_segment_deleted(segment)
         ]
         if not candidates:
             self._notify("No other unfinished article was detected.")
@@ -1937,6 +2401,9 @@ class MainWindow(QMainWindow):
         if any(block_id in self._finished_segment_keys for block_id in participants):
             self._notify("Reopen the finished article before merging it.")
             return None
+        if any(block_id in self._deleted_segment_keys for block_id in participants):
+            self._notify("Restore the deleted article before merging it.")
+            return None
         merged = 0
         for block_id in participants[1:]:
             if segmentation.remove_boundary(block_id):
@@ -1951,6 +2418,7 @@ class MainWindow(QMainWindow):
         key = segmentation.boundaries[target_position].block_id
         self._current_segment_key = key
         self._report_segmentation_issues(segmentation)
+        self._refresh_selected_blocks_view()
         target = self._segment_for_key(key)
         number = str((target or {}).get("abstract_number", "")).strip() or "ABSN"
         if target is not None:
@@ -2268,11 +2736,46 @@ class MainWindow(QMainWindow):
         title = re.sub(r"^\s*\([A-Z][A-Z0-9./-]{1,30}\)\s+", "", title, count=1, flags=re.IGNORECASE).strip()
         return self._strip_abstract_number_from_title(title)
 
+    def _current_article_block_ids(self) -> frozenset[str] | None:
+        """Blocks of the article being worked on, or None when none is current.
+
+        The Selected Blocks panel inspects one article at a time: a proceedings
+        PDF holds many papers, and listing every block buries the few that
+        belong to the tab the user chose. Until an article is current the whole
+        document stays visible, so nothing is hidden before the first choice.
+        """
+
+        if self.document is None or self._current_segment_key is None:
+            return None
+        current = self._current_segment()
+        if current is None:
+            return None
+        _segment, key = current
+        if not key:
+            return None
+        segmentation = self._article_segmentation()
+        if segmentation is None:
+            return None
+        article = segmentation.article_position(key)
+        if article is None:
+            return None
+        return frozenset(segmentation.block_ids(article))
+
     def _populate_tree(self) -> None:
-        """Populate the structure tree with detected blocks."""
+        """Populate the structure tree with blocks of the current article."""
 
         if self.document is None:
             return
+        scope = self._current_article_block_ids()
+        if scope is not None and not scope.issuperset(self._selected_block_ids):
+            # Drop any selection left over from the article the user left, so
+            # the panel, the page highlight and the merge queue stay in step.
+            self._selected_block_ids &= scope
+            viewer = getattr(self, "viewer", None)
+            if viewer is not None:
+                viewer.set_selected_blocks(
+                    self._selected_block_ids, next(iter(self._selected_block_ids), None)
+                )
         self.tree.blockSignals(True)
         self.tree.clear_dynamic_items()
         buckets: dict[str, list] = {
@@ -2285,6 +2788,8 @@ class MainWindow(QMainWindow):
             "Keywords": [],
         }
         for block in self.document.blocks:
+            if scope is not None and block.id not in scope:
+                continue
             if block.role == "title":
                 buckets["Title"].append(block)
             elif block.role == "author":
@@ -2309,6 +2814,17 @@ class MainWindow(QMainWindow):
         self.tree.expandAll()
         self.tree.blockSignals(False)
         self._refresh_zone_list()
+
+    def _refresh_selected_blocks_view(self) -> None:
+        """Re-scope the Selected Blocks panel to the article now being worked on."""
+
+        # A window assembled without Qt (tests) has no tree to fill.
+        if getattr(self, "tree", None) is None:
+            return
+        self._populate_tree()
+        self._sync_tree_selection()
+        self._update_selection_status()
+        self._update_selection_panel()
 
     def _sync_auto_zones(self) -> None:
         """Keep auto-generated zones aligned with currently classified blocks."""
@@ -3017,6 +3533,7 @@ class MainWindow(QMainWindow):
                     source=current.source,
                     number=number,
                     marker_block_id=block.id,
+                    deleted=current.deleted,
                 )
                 self._replace_article_segments(
                     segmentation.to_legacy_segments(self.document.blocks)
@@ -3037,6 +3554,7 @@ class MainWindow(QMainWindow):
         )
         self._current_segment_key = block.id
         self._report_segmentation_issues(segmentation)
+        self._refresh_selected_blocks_view()
         self._refresh_article_buttons()
         self._notify(
             f"Article {number} starts at {block.id}; the article before it is ready to finish."
@@ -3456,8 +3974,16 @@ class MainWindow(QMainWindow):
             for key in (finished_keys if isinstance(finished_keys, list) else [])
             if str(key) in known
         ]
+        deleted_keys = action.get("deleted_keys")
+        self._deleted_segment_keys = [
+            str(key)
+            for key in (deleted_keys if isinstance(deleted_keys, list) else [])
+            if str(key) in known
+        ]
         current_key = action.get("current_key")
         self._current_segment_key = str(current_key) if current_key in known else None
+        self._sync_deleted_block_overlay()
+        self._refresh_selected_blocks_view()
         self._refresh_article_buttons()
         self._notify(
             f"Undid {action.get('label', 'the article edit')}; "
@@ -3775,8 +4301,16 @@ class MainWindow(QMainWindow):
     def _update_selection_status(self) -> None:
         block_count = len(self._selected_block_ids)
         zone_count = len(self._selected_zone_ids)
+        current = self._current_segment() if self._current_segment_key is not None else None
+        if current is not None:
+            segment, _key = current
+            number = str(segment.get("abstract_number", "")).strip() or "ABSN"
+            scope_note = f" Showing article {number} only; pick another tab to switch."
+        else:
+            scope_note = " Showing every detected block until an article is chosen."
         self.tree_hint.setText(
-            f"Selected blocks: {block_count}; zones: {zone_count}. Use Ctrl-click for individual blocks or Ctrl+Shift-click for a range."
+            f"Selected blocks: {block_count}; zones: {zone_count}.{scope_note} "
+            "Use Ctrl-click for individual blocks or Ctrl+Shift-click for a range."
         )
 
     def _update_selection_panel(self) -> None:
@@ -3836,8 +4370,10 @@ class MainWindow(QMainWindow):
         self._review_block_ids = list(refine_report.review_ids)
         self._review_index = -1
         self._finished_segment_keys = []
+        self._deleted_segment_keys = []
         self._current_segment_key = None
         self._invalidate_segment_identity()
+        self.viewer.set_deleted_block_ids(set())
         if refine_report.changed_count:
             self._log(
                 f"Auto-refined {refine_report.changed_count} block role(s); "
@@ -4051,34 +4587,42 @@ class MainWindow(QMainWindow):
             self._log(f"Reassigned {zone.id} to role '{new_role}'")
             return
 
-        if len(self._selected_block_ids) != 1:
-            QMessageBox.information(self, "Select one block", "Select exactly one block to assign a role.")
+        selected_blocks = [
+            block for block in self.document.blocks if block.id in self._selected_block_ids
+        ]
+        if not selected_blocks:
+            QMessageBox.information(self, "Select blocks", "Select at least one block to assign a role.")
             return
-
-        block_id = next(iter(self._selected_block_ids))
-        block = next((b for b in self.document.blocks if b.id == block_id), None)
-        if block is None:
-            return
-        if self._article_locked(block):
+        # A document has exactly one title, so the title role stays a single block.
+        if new_role == "title" and len(selected_blocks) != 1:
             QMessageBox.information(
-                self,
-                "Article finished",
-                "This block belongs to a finished article and is locked. Use Reopen Article to unlock it first.",
+                self, "Select one title block", "Select exactly one block to assign the title role."
             )
             return
-
-        if block.role == new_role:
+        locked_blocks = self._locked_selection_blocks(selected_blocks)
+        if locked_blocks:
+            self._warn_locked_blocks(locked_blocks)
             return
 
-        previous_role = block.role
-        block.role = new_role
-        self._sync_block_abstract_number_role(block, previous_role)
-        if new_role == "title":
-            self.document.metadata["manual_title_block_id"] = block_id
+        changed_blocks = []
+        for block in selected_blocks:
+            if block.role == new_role:
+                continue
+            previous_role = block.role
+            block.role = new_role
+            self._sync_block_abstract_number_role(block, previous_role)
+            changed_blocks.append(block)
+        if not changed_blocks:
+            return
+
+        title_block_id = next(
+            (block.id for block in changed_blocks if new_role == "title"), None
+        )
+        if title_block_id is not None:
+            self.document.metadata["manual_title_block_id"] = title_block_id
             for other in self.document.blocks:
-                if other.id != block_id and other.role == "title":
+                if other.id != title_block_id and other.role == "title":
                     other.role = "unclassified"
-        self._selected_block_ids = {block_id}
         self._selected_zone_id = None
         self._selected_zone_ids.clear()
         self._update_document_model()
@@ -4086,12 +4630,13 @@ class MainWindow(QMainWindow):
         self.viewer.set_zones([asdict(zone) for zone in self.document.zones])
         self._populate_tree()
         self._sync_tree_selection()
+        block_id = title_block_id or next(iter(self._selected_block_ids))
         self.viewer.set_selected_blocks(self._selected_block_ids, block_id)
         self._update_selection_status()
         self._update_selection_panel()
         self._select_block_by_id(block_id, preserve_selection=True)
         self._update_selection_panel()
-        self._log(f"Reassigned {block.id} to role '{new_role}'")
+        self._log(f"Reassigned {len(changed_blocks)} block(s) to role '{new_role}'")
 
     def _blocks_for_zone(self, zone: DocumentZone) -> list:
         """Return blocks whose geometry matches the zone's source regions."""
