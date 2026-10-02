@@ -1,1 +1,9 @@
+# Runtime dependencies.
+PySide6>=6.6,<7
+PyMuPDF>=1.24,<2
+# Preferred XML writer; the generator falls back to the stdlib without it.
+lxml>=5,<7
+
+# Optional structural enrichment. The extractor continues with PyMuPDF alone
+# when Docling is not installed.
 docling>=2.115,<3

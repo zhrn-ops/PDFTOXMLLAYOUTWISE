@@ -549,12 +549,7 @@ class MainWindow(QMainWindow):
                 "a selection, before exporting. Deleted articles are always left out.",
             )
             return
-        documents = [self._document_for_segment(segment, export_document) for segment in segments]
-        if len(documents) <= 1 and len(all_segments) <= 1 and not self._deleted_segment_keys:
-            # A PDF with at most one article (or no detected segments at all) has
-            # no boundary to confirm, so it keeps the whole-document export. A
-            # deleted article must never leak back through this fallback.
-            documents = [export_document]
+        documents = self._documents_to_export(export_document)
         output_dir = self._choose_output_directory(
             "Choose XML output folder", self.config.generated_xml_dir
         )
@@ -651,20 +646,14 @@ class MainWindow(QMainWindow):
         validation_errors = self.validator.validate_document(export_document)
         for error in validation_errors:
             self._log(f"Document validation error: {error.message}")
-        all_segments = list(export_document.metadata.get("article_segments", []))
-        segments = self._exportable_segments(all_segments)
-        if segments:
-            documents = [self._document_for_segment(segment, export_document) for segment in segments]
-        elif all_segments:
+        documents = self._documents_to_export(export_document)
+        if not documents:
             # Detected articles that are deleted or still only suggestions must
             # not leak back in through a whole-document export.
-            documents = []
             self._log(
                 "No article is ready to export: finish an article or build one from a "
                 "selection, then run the pipeline again."
             )
-        else:
-            documents = [export_document]
         output_dir = self.config.generated_xml_dir
         output_dir.mkdir(parents=True, exist_ok=True)
         output_paths: list[Path] = []
@@ -1677,6 +1666,28 @@ class MainWindow(QMainWindow):
             and self._segment_is_confirmed(segment, segments, index)
         ]
 
+    def _documents_to_export(self, export_document: Document) -> list[Document]:
+        """Split an export document into one document per article to write.
+
+        A PDF the extractor did not segment is one article with no boundary to
+        confirm, so it exports whole. A single *detected* segment is still only
+        a range of that PDF, so it is scoped like any other article; exporting
+        the whole document for it would resurrect every block the segment
+        excluded. Detected articles that are deleted or still only suggestions
+        yield nothing.
+        """
+
+        all_segments = list(export_document.metadata.get("article_segments", []))
+        segments = self._exportable_segments(all_segments)
+        if segments:
+            return [
+                self._document_for_segment(segment, export_document)
+                for segment in segments
+            ]
+        if all_segments:
+            return []
+        return [export_document]
+
     def delete_article(self, segment: dict[str, object] | None = None) -> bool:
         """Drop a detected article from every export without losing its blocks.
 
@@ -2154,6 +2165,18 @@ class MainWindow(QMainWindow):
                 key=reading_order_key,
             )
             snippet = " ".join(" ".join(block.text.split()) for block in title_blocks)
+            # The number is already shown as "ABSN <number>" in the label, so it
+            # must not be repeated at the front of the title the tab previews.
+            # Strip the entered article number (and any earlier one kept as an
+            # alias) plus a parenthesised conference marker such as "(S100)".
+            snippet = self._strip_abstract_number_from_title(snippet, number)
+            snippet = re.sub(
+                r"^\s*\([A-Z][A-Z0-9./-]{1,30}\)\s+",
+                "",
+                snippet,
+                count=1,
+                flags=re.IGNORECASE,
+            ).strip()
         return f"{text} | {snippet[:70]}" if snippet else text
 
     # A conference marker printed on a line of its own ("P-605", "S100", "4349").
@@ -2574,20 +2597,42 @@ class MainWindow(QMainWindow):
             for block in source.blocks
             if belongs_to_segment(block)
         ]
-        block_ids = {block.id for block in blocks}
         raw_blocks = [
             replace(block, metadata=dict(block.metadata))
             for block in (source.raw_blocks or source.blocks)
             if belongs_to_segment(block)
         ]
-        paragraphs = [
-            replace(
-                paragraph,
-                source_line_ids=[line_id for line_id in paragraph.source_line_ids if line_id in block_ids],
+        # Paragraph lines always name raw blocks, so resolve them there rather
+        # than through a virtual merged display block, whose text already covers
+        # several of those lines.
+        raw_by_id = {block.id: block for block in (source.raw_blocks or source.blocks)}
+        paragraphs = []
+        for paragraph in source.paragraphs:
+            kept_blocks = [
+                raw_by_id[str(line_id)]
+                for line_id in paragraph.source_line_ids
+                if str(line_id) in raw_by_id
+                and belongs_to_segment(raw_by_id[str(line_id)])
+            ]
+            if not kept_blocks:
+                continue
+            # The paragraph was reconstructed across the whole PDF, so trimming
+            # its source ids is not enough: its text still spells out the lines
+            # of a neighbouring article. Rebuild the text (and the role) from
+            # only the lines this article owns.
+            roles = [
+                block.role
+                for block in kept_blocks
+                if block.role and block.role != "unclassified"
+            ]
+            paragraphs.append(
+                replace(
+                    paragraph,
+                    text=" ".join(" ".join(block.text.split()) for block in kept_blocks),
+                    source_line_ids=[block.id for block in kept_blocks],
+                    role=max(set(roles), key=roles.count) if roles else "unclassified",
+                )
             )
-            for paragraph in source.paragraphs
-            if any(line_id in block_ids for line_id in paragraph.source_line_ids)
-        ]
         metadata = dict(source.metadata)
         metadata["abstract_number"] = str(segment.get("abstract_number") or "ABSN")
         # A hand-made article usually has no marker block to exclude.

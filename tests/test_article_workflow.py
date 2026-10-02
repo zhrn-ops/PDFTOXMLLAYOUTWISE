@@ -633,6 +633,56 @@ def test_exported_articles_are_named_after_their_abstract_number():
     assert MainWindow._article_filename(unnamed, 1, 1) == "article.xml"
 
 
+def test_article_tab_title_drops_the_number_the_user_entered():
+    """The entered article number is an id, not part of the title a tab shows."""
+
+    title = _block(
+        "P-605 GROWTH AND PUBERTAL OUTCOMES",
+        block_id="block_001",
+        metadata={"reading_order": 1},
+    )
+    title.role = "title"
+    document = Document(
+        blocks=[title], raw_blocks=[title], metadata={"abstract_number": "ABSN"}
+    )
+    window = _window(document)
+    segment = {
+        "index": 1,
+        "abstract_number": "P-605",
+        "start_page": 1,
+        "end_page": 1,
+    }
+    document.metadata["article_segments"] = [segment]
+
+    summary = window._segment_summary(segment)
+
+    # The label still names the article, but the previewed title does not.
+    assert "ABSN P-605" in summary
+    snippet = summary.rsplit("|", 1)[-1]
+    assert "P-605" not in snippet
+    assert snippet.strip() == "GROWTH AND PUBERTAL OUTCOMES"
+
+
+def test_article_tab_title_drops_a_parenthesised_marker():
+    """A "(S100)" prefix is a conference marker, not the start of the title."""
+
+    title = _block(
+        "(S100) A Study Of Peptides", block_id="block_001", metadata={"reading_order": 1}
+    )
+    title.role = "title"
+    document = Document(
+        blocks=[title], raw_blocks=[title], metadata={"abstract_number": "ABSN"}
+    )
+    window = _window(document)
+    segment = {"index": 1, "abstract_number": "ABSN", "start_page": 1, "end_page": 1}
+    document.metadata["article_segments"] = [segment]
+
+    summary = window._segment_summary(segment)
+
+    assert "(S100)" not in summary
+    assert summary.endswith("A Study Of Peptides")
+
+
 def test_marker_lines_are_dropped_from_the_paragraph_model():
     marker = _block("Abstract No: 4349", block_id="m1")
     marker.role = "abstract_number"
@@ -750,6 +800,35 @@ def test_finishing_a_selection_exports_only_its_blocks(tmp_path):
         "block_006",
     ]
     assert window._finished_segment_keys == ["block_004"]
+
+
+def test_exported_paragraph_drops_lines_outside_the_article(tmp_path):
+    """A paragraph reconstructed across the PDF must be trimmed to the article.
+
+    The exported view narrows a paragraph's source lines to the article's
+    blocks; its text has to be rebuilt from those same lines, or a continuation
+    that spans the boundary spells out the next article's words in the XML.
+    """
+
+    document = _stacked_page_document()
+    window = _window(document)
+    window.linker = AuthorLinker()
+    window.paragraph_reconstructor = ParagraphReconstructor()
+    # A continuation that wrongly stretches across the article boundary.
+    window._html_preview_merges = [("block_003", "block_004")]
+    window._update_document_model = lambda: None
+    window.split_article_at_block("block_004")
+
+    segment = window._segment_for_key("block_001")
+    exported = window._document_for_segment(
+        segment, window._document_with_html_preview_continuations()
+    )
+
+    text = " ".join(paragraph.text for paragraph in exported.paragraphs)
+    assert "Background: urea cycle disorders are rare." in text
+    # block_004 starts the next article, so none of its text may leak in.
+    assert "P-606" not in text
+    assert "LONGITUDINAL ASSESSMENT OF PROTEIN TOLERANCE" not in text
 
 
 def test_finishing_a_selection_starts_the_next_article_after_it(tmp_path):
@@ -882,6 +961,38 @@ def test_a_pdf_without_real_segmentation_exports_as_one_article():
     ]
 
     assert window._exportable_segments(segments) == segments
+
+
+def test_no_detected_segments_exports_the_whole_document():
+    """A PDF with no boundaries is a single article and exports whole."""
+
+    document = _stacked_page_document()
+    window = _window(document)
+
+    documents = window._documents_to_export(document)
+
+    assert documents == [document]
+
+
+def test_a_single_detected_segment_is_scoped_and_not_the_whole_pdf():
+    """One detected article is still a range; only its own blocks may export.
+
+    The export used to fall back to the whole document whenever there was at
+    most one segment, which dumped every excluded block - other articles'
+    lines included - into the XML.
+    """
+
+    document = _stacked_page_document()
+    window = _window(document)
+    window.linker = AuthorLinker()
+    document.metadata["article_segments"] = [
+        {"index": 1, "abstract_number": "ABSN", "start_page": 1, "end_page": 1, "columns": [1]}
+    ]
+
+    documents = window._documents_to_export(document)
+
+    assert len(documents) == 1
+    assert [block.id for block in documents[0].blocks] == ["block_007", "block_008"]
 
 
 def test_a_deleted_unconfirmed_article_stays_out_of_the_export():
