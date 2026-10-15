@@ -14,7 +14,36 @@ import fitz
 from pdf_to_jats.models.block import TextBlock, reading_order_key
 from pdf_to_jats.models.document import Document
 
+try:  # numpy turns the per-line ink scan into C-speed slicing; it is optional.
+    import numpy as _numpy
+except ImportError:  # pragma: no cover - only when numpy is not installed
+    _numpy = None
+
 LOGGER = logging.getLogger(__name__)
+
+
+class _PageInk:
+    """A rendered page prepared once so every line can be checked cheaply.
+
+    ``pixmap.samples`` copies the whole page buffer on each access, so the raw
+    bytes and (when numpy is available) a 2-D view of them are read a single
+    time per page instead of once per text line.
+    """
+
+    __slots__ = ("width", "height", "stride", "samples", "array")
+
+    def __init__(self, pixmap: fitz.Pixmap) -> None:
+        self.width = pixmap.width
+        self.height = pixmap.height
+        self.stride = pixmap.stride
+        self.samples = pixmap.samples
+        self.array = None
+        if _numpy is None or self.stride <= 0:
+            return
+        buffer = _numpy.frombuffer(self.samples, dtype=_numpy.uint8)
+        rows = len(self.samples) // self.stride
+        if rows:
+            self.array = buffer[: rows * self.stride].reshape(rows, self.stride)
 
 
 class PDFExtractor:
@@ -55,7 +84,11 @@ class PDFExtractor:
             for page_index, page in enumerate(pdf, start=1):
                 visible_area = self._visible_page_rect(page)
                 text_dict = page.get_text("dict", clip=visible_area)
-                page_pixmap = self._render_visible_page(page, visible_area) if self.visible_text_only else None
+                page_ink = (
+                    _PageInk(self._render_visible_page(page, visible_area))
+                    if self.visible_text_only
+                    else None
+                )
                 page_blocks: list[TextBlock] = []
                 for block in text_dict.get("blocks", []):
                     if block.get("type") != 0:
@@ -75,7 +108,7 @@ class PDFExtractor:
                         text = self._line_text(spans)
                         if not text.strip():
                             continue
-                        if page_pixmap is not None and not self._block_is_human_visible(line_bbox, page_pixmap, visible_area):
+                        if page_ink is not None and not self._block_is_human_visible(line_bbox, page_ink, visible_area):
                             hidden_text_line_count += 1
                             continue
 
@@ -103,12 +136,14 @@ class PDFExtractor:
                             # (and so score as a title) while real bold titles
                             # did not.
                             bold=bool(flags & 16),
-                            italic=bool(flags & 2),
+                            italic=bool(flags & 2),
                             color=color,
                             alignment=self._infer_line_alignment(line, visible_area),
                             metadata={
-                                "raw_block": block,
-                                "raw_line": line,
+                                # The PyMuPDF block/line dicts are not kept: every
+                                # line of a paragraph points at the same parent
+                                # block, so carrying it here made asdict() and JSON
+                                # export deep-copy that block once per line.
                                 "line_index": line_index,
                                 "visible_area": [float(visible_area.x0), float(visible_area.y0), float(visible_area.x1), float(visible_area.y1)],
                                 "visible_text_only": self.visible_text_only,
@@ -313,6 +348,11 @@ class PDFExtractor:
         patterns = [
             r"^\s*\(([A-Z][A-Z0-9./-]{1,30})\)\s+",
             r"^\s*(?=[A-Z0-9./-]{1,30}\d)([A-Z0-9][A-Z0-9./-]{1,30})\s*(?:\||\u2502)\s*",
+            # Session-style codes such as WM1.1, WM1.2 – letters immediately
+            # followed by digits, optionally with a dot+number suffix.  These
+            # appear at the very top of a conference abstract entry, either on
+            # their own or immediately before the title text.
+            r"^\s*([A-Z]{1,4}\d+(?:\.\d+)?)(?:\s+|$)",
             r"^\s*(\d{3,6})\s*$",
             r"\b(?:abstract\s*(?:no\.?|number|nr\.?|id)?|absn)\s*[:#-]?\s*([A-Z0-9][A-Z0-9./-]{1,30})\b",
         ]
@@ -334,6 +374,11 @@ class PDFExtractor:
         patterns = (
             r"^\s*\(([A-Z][A-Z0-9./-]{1,30})\)\s+",
             r"^\s*(?=[A-Z0-9./-]{1,30}\d)([A-Z0-9][A-Z0-9./-]{1,30})\s*(?:\||\u2502)\s*",
+            # Session-style codes such as WM1.1, WM1.2 – letters immediately
+            # followed by digits, optionally with a dot+number suffix.  These
+            # appear at the very top of a conference abstract entry, either on
+            # their own or immediately before the title text.
+            r"^\s*([A-Z]{1,4}\d+(?:\.\d+)?)(?:\s+|$)",
             r"\b(?:abstract\s*(?:no\.?|number|nr\.?|id)?|absn)\s*[:#-]?\s*([A-Z0-9][A-Z0-9./-]{1,30})\b",
         )
         for block in sorted(blocks, key=reading_order_key):
@@ -349,8 +394,10 @@ class PDFExtractor:
                     seen.add(key)
                 break
         # _build_article_segments needs the marker blocks' column metadata.
-        self._marker_blocks = blocks
+        marker_ids = {m["block_id"] for m in markers}
+        self._marker_blocks = [block for block in blocks if block.id in marker_ids]
         return markers
+
 
     def _build_article_segments(
         self, markers: list[dict[str, Any]], page_count: int
@@ -411,36 +458,35 @@ class PDFExtractor:
                 return None
         return [own_column]
 
-    def _block_is_human_visible(self, bbox: fitz.Rect, pixmap: fitz.Pixmap, visible_area: fitz.Rect) -> bool:
-        """Return whether a text line has rendered ink in its own bounding box."""
+    def _block_is_human_visible(self, bbox: fitz.Rect, ink: _PageInk, visible_area: fitz.Rect) -> bool:
+        """Return whether a text line has rendered ink in its own bounding box.
+
+        The page is scanned once into a grayscale buffer; each line only slices
+        the region it covers. Counting dark pixels with numpy keeps a large PDF
+        proportional to its pixels rather than to lines multiplied by pixels.
+        """
 
         if bbox.width <= 0 or bbox.height <= 0:
             return False
 
-        scale_x = pixmap.width / max(visible_area.width, 1.0)
-        scale_y = pixmap.height / max(visible_area.height, 1.0)
-        x0 = max(0, min(pixmap.width - 1, int((bbox.x0 - visible_area.x0) * scale_x)))
-        x1 = max(0, min(pixmap.width, int((bbox.x1 - visible_area.x0) * scale_x)))
-        y0 = max(0, min(pixmap.height - 1, int((bbox.y0 - visible_area.y0) * scale_y)))
-        y1 = max(0, min(pixmap.height, int((bbox.y1 - visible_area.y0) * scale_y)))
+        scale_x = ink.width / max(visible_area.width, 1.0)
+        scale_y = ink.height / max(visible_area.height, 1.0)
+        x0 = max(0, min(ink.width - 1, int((bbox.x0 - visible_area.x0) * scale_x)))
+        x1 = max(0, min(ink.width, int((bbox.x1 - visible_area.x0) * scale_x)))
+        y0 = max(0, min(ink.height - 1, int((bbox.y0 - visible_area.y0) * scale_y)))
+        y1 = max(0, min(ink.height, int((bbox.y1 - visible_area.y0) * scale_y)))
 
         if x1 <= x0 or y1 <= y0:
             return False
 
-        samples = pixmap.samples
-        stride = pixmap.stride
-        dark_count = 0
-        total_count = 0
-
-        for yy in range(y0, y1):
-            row_offset = yy * stride
-            for xx in range(x0, x1):
-                index = row_offset + xx
-                if index >= len(samples):
-                    continue
-                total_count += 1
-                if samples[index] < self.dark_threshold:
-                    dark_count += 1
+        if ink.array is not None:
+            region = ink.array[y0:y1, x0:x1]
+            total_count = int(region.size)
+            dark_count = int(_numpy.count_nonzero(region < self.dark_threshold))
+        else:
+            dark_count, total_count = self._count_dark_pixels(
+                ink.samples, ink.stride, x0, x1, y0, y1
+            )
 
         if total_count == 0:
             return False
@@ -449,6 +495,29 @@ class PDFExtractor:
         # a minimum number of dark pixels as well as a low density threshold.
         dark_ratio = dark_count / total_count
         return dark_count >= 4 and dark_ratio >= 0.003
+
+    def _count_dark_pixels(
+        self, samples: bytes, stride: int, x0: int, x1: int, y0: int, y1: int
+    ) -> tuple[int, int]:
+        """Count dark pixels in a page region without numpy.
+
+        Kept as the fallback for a numpy-free install; it mirrors the vectorized
+        path exactly, including skipping indices past the end of the buffer.
+        """
+
+        dark_count = 0
+        total_count = 0
+        sample_count = len(samples)
+        for yy in range(y0, y1):
+            row_offset = yy * stride
+            for xx in range(x0, x1):
+                index = row_offset + xx
+                if index >= sample_count:
+                    continue
+                total_count += 1
+                if samples[index] < self.dark_threshold:
+                    dark_count += 1
+        return dark_count, total_count
 
     def _order_page_blocks(
         self, blocks: list[TextBlock], visible_area: fitz.Rect
@@ -482,10 +551,10 @@ class PDFExtractor:
                 # Full-width lines keep no column: they span every column.
                 spanning.append(block)
 
-        minimum = max(self.COLUMN_MIN_BLOCKS, int(len(blocks) * self.COLUMN_MIN_BLOCK_RATIO))
-        if len(left) < minimum or len(right) < minimum:
-            return sorted(blocks, key=lambda block: (block.y, block.x))
-
+        # A gutter was found and validated (minimum gap width + vertical
+        # overlap), so column-aware ordering is reliable even with few blocks.
+        # Sorting by (y, column) would still interleave columns; instead, read
+        # each column top-to-bottom then concatenate.
         left.sort(key=lambda block: (block.y, block.x))
         right.sort(key=lambda block: (block.y, block.x))
         spanning.sort(key=lambda block: (block.y, block.x))

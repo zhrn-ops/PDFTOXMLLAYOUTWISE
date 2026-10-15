@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from pdf_to_jats.core.author_linker import AuthorLinker
+from pdf_to_jats.core.author_linker import AuthorLinker, LinkedAuthors
 from pdf_to_jats.core.auto_refiner import AutoRefiner, abstract_number_marker, is_abstract_heading
 from pdf_to_jats.core.jats_generator import JATSGenerator
 from pdf_to_jats.core.pdf_extractor import PDFExtractor
@@ -46,7 +46,11 @@ from pdf_to_jats.core.paragraph_reconstructor import ParagraphReconstructor
 from pdf_to_jats.core.semantic_classifier import SemanticClassifier
 from pdf_to_jats.core.validator import Validator
 from pdf_to_jats.llm.openrouter_client import OpenRouterClient, OpenRouterRateLimitError
-from pdf_to_jats.llm.prompts import QUESTION_ANSWER_PROMPT, ROLE_ASSIGNMENT_PROMPT
+from pdf_to_jats.llm.prompts import (
+    AUTHOR_AFFILIATION_PROMPT,
+    QUESTION_ANSWER_PROMPT,
+    ROLE_ASSIGNMENT_PROMPT,
+)
 from pdf_to_jats.gui.pdf_viewer import PDFViewer
 from pdf_to_jats.gui.properties_panel import (
     AuthorAffiliationReviewPanel,
@@ -62,12 +66,14 @@ from pdf_to_jats.models.document import (
     REFINE_ROLES,
     block_matches_segment,
     segment_is_manual,
+    segment_member_ids,
 )
 from pdf_to_jats.models.paragraph import Paragraph
 from pdf_to_jats.models.segmentation import (
     SOURCE_MANUAL,
     ArticleBoundary,
     Segmentation,
+    common_column,
     legacy_segment_boundaries,
 )
 from pdf_to_jats.utils.config import load_config, save_openrouter_settings
@@ -109,6 +115,17 @@ class MainWindow(QMainWindow):
         self._finished_segment_keys: list[str] = []
         self._deleted_segment_keys: list[str] = []
         self._current_segment_key: str | None = None
+        # The normal PDF workflow is deliberately serial: completing one
+        # article leaves no article active until the operator supplies the next
+        # abstract number.  Tests and older saved segment data retain their
+        # legacy tab-to-tab behaviour unless this is enabled by _load_pdf_path.
+        self._startup_flow = False
+        # Author/affiliation links an LLM produced per article, so the review
+        # panel and the exported XML show the same parse instead of re-reading
+        # the whole document's byline.
+        self._llm_links_by_segment: dict[str, LinkedAuthors] = {}
+        self._manual_link_review_segments: set[str] = set()
+        self._manual_document_author_links: dict[str, list[str]] = {}
         # Cached article identities, held together with the block and segment
         # lists they were computed from so a replaced list invalidates them.
         self._segment_identity_cache: tuple | None = None
@@ -255,6 +272,9 @@ class MainWindow(QMainWindow):
         self.props = PropertiesPanel()
         self.metadata_panel = MetadataPanel()
         self.author_affiliation_review_panel = AuthorAffiliationReviewPanel()
+        self.author_affiliation_review_panel.linksApplied.connect(
+            self._apply_author_affiliation_links
+        )
         self.viewer.setMinimumSize(0, 0)
         self.tree.setMinimumSize(0, 0)
         self.props.setMinimumSize(0, 0)
@@ -344,8 +364,8 @@ class MainWindow(QMainWindow):
         self.merge_segments_btn.clicked.connect(self.merge_selected_segments)
         self.delete_article_btn = QPushButton("Delete Article")
         self.delete_article_btn.setToolTip(
-            "Keep the current article visible but leave it out of every export.\n"
-            "Right-click its tab and choose Restore to export it again. Ctrl+Z undoes."
+            "Remove the current article from Detected Articles and every export.\n"
+            "Right-click the article's first line in the page to restore it. Ctrl+Z undoes."
         )
         self.delete_article_btn.setEnabled(False)
         self.delete_article_btn.clicked.connect(self.delete_current_article)
@@ -408,6 +428,10 @@ class MainWindow(QMainWindow):
     TAB_METADATA = 3
     TAB_AUTHOR_AFFILIATIONS = 4
     TAB_PREVIEW = 5
+
+    # Extraction-time article ranges are reference only: an article exists once
+    # the user classifies its title.
+    DETECTED_SEGMENTS_KEY = "detected_article_segments"
 
     def _show_work_tab(self, index: int) -> None:
         """Bring one of the right-side work-area tabs to the front."""
@@ -498,6 +522,87 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Error", str(exc))
 
+    def _auto_classify(self) -> None:
+        """Let OpenRouter author the roles, with the auto-refiner as the only "
+        safety net the user has to read and fix.
+
+        The classification prompt already returns every author and affiliation
+        it finds, so nothing else is handed to the user for a model to "
+        mis-handle. The refiner only reviews what it flagged, so the user is
+        never asked to second-guess text that needed nothing.
+        """
+
+        if self.document is None:
+            return
+        self._update_document_model()
+        by_id = {block.id: block for block in self.document.blocks}
+        payload = {
+            "blocks": [
+                {
+                    "block_id": block.id,
+                    "page": block.page,
+                    "text": block.text,
+                    "bbox": block.bbox,
+                    "font_size": block.font_size,
+                    "font_name": block.font_name,
+                    "bold": block.bold,
+                    "italic": block.italic,
+                    "alignment": block.alignment,
+                    "structural_evidence": block.metadata.get("docling", {}),
+                }
+                for block in self.document.blocks
+            ]
+        }
+        try:
+            answer_summary = self.openrouter_client.classify(
+                prompt=QUESTION_ANSWER_PROMPT,
+                payload=payload,
+            )
+            raw_response = self.openrouter_client.classify(
+                prompt=ROLE_ASSIGNMENT_PROMPT,
+                payload={"blocks": payload["blocks"], "answer_summary": answer_summary},
+            )
+            if isinstance(raw_response, dict):
+                raw_response["answer_summary"] = answer_summary
+        except OpenRouterRateLimitError as exc:
+            self._log(f"OpenRouter classification rate-limited: {exc}")
+            self._log("Auto-classify skipped; heuristic roles remain.")
+            return
+        except Exception as exc:
+            self._log(f"OpenRouter auto-classify failed: {exc}")
+            self._log("Auto-classify skipped; heuristic roles remain.")
+            return
+        
+        changed_roles: dict[str, str] = {}
+        for item in raw_response.get("assignments", []) if isinstance(raw_response, dict) else []:
+            block_id = str(item.get("block_id", "")).strip()
+            role = str(item.get("role", "")).strip().lower()
+            try:
+                confidence = float(item.get("confidence", 0.0))
+            except Exception:
+                confidence = 0.0
+            block = by_id.get(block_id)
+            if block is None or not role:
+                continue
+            if block.role == role and block.confidence == confidence:
+                continue
+            block.role = role
+            block.confidence = confidence
+            block.metadata["role_source"] = "llm"
+            if role == "abstract_number":
+                self._apply_abstract_number_role(block)
+            changed_roles[block_id] = role
+
+        self._update_document_model()
+        self._populate_tree()
+        self._sync_tree_selection()
+        self._update_selection_status()
+        self._update_selection_panel()
+        if changed_roles:
+            self._log(f"Auto-classified roles: {len(changed_roles)} block(s), no manual review.")
+        else:
+            self._log("OpenRouter returned no roles to classify.")
+
     def dragEnterEvent(self, event) -> None:  # type: ignore[override]
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
@@ -513,6 +618,14 @@ class MainWindow(QMainWindow):
     def generate_xml(self) -> None:
         if self.document is None:
             QMessageBox.information(self, "No document", "Load a PDF first.")
+            return
+        if not self._article_starts():
+            QMessageBox.information(
+                self,
+                "No article started yet",
+                "Enter an article/abstract number in Article Metadata and select "
+                "Start Article With This Number before exporting XML.",
+            )
             return
         selected_blocks = [block for block in self.document.blocks if block.id in self._selected_block_ids]
         if len(selected_blocks) >= 2:
@@ -572,6 +685,14 @@ class MainWindow(QMainWindow):
     def export_json(self) -> None:
         if self.document is None:
             QMessageBox.information(self, "No document", "Load a PDF first.")
+            return
+        if not self._article_starts():
+            QMessageBox.information(
+                self,
+                "No article started yet",
+                "Enter an article/abstract number in Article Metadata and select "
+                "Start Article With This Number before exporting JSON.",
+            )
             return
         output_dir = self._choose_output_directory(
             "Choose JSON output folder", self.config.output_dir
@@ -639,6 +760,12 @@ class MainWindow(QMainWindow):
 
         if self.document is None:
             QMessageBox.information(self, "No document", "Load a PDF first.")
+            return
+        if not self._article_starts():
+            self._log(
+                "No article started yet: enter an article/abstract number in Article "
+                "Metadata and select Start Article With This Number before running the pipeline."
+            )
             return
         self._update_document_model()
         self._log_link_issues()
@@ -907,6 +1034,14 @@ class MainWindow(QMainWindow):
             return []
         segments = self.document.metadata.get("article_segments", [])
         return [segment for segment in segments if isinstance(segment, dict)]
+
+    def _visible_segments(self) -> list[dict[str, object]]:
+        """Segments the Detected Articles panel shows; deleted ones are hidden."""
+
+        return [
+            segment for segment in self._document_segments() if not self._is_segment_deleted(segment)
+        ]
+
     @staticmethod
     def _segment_locator(segment: dict[str, object]) -> tuple:
         """Value fingerprint used to recognize a segment dict across copies.
@@ -949,7 +1084,21 @@ class MainWindow(QMainWindow):
         cached = self._segment_identity_cache
         if cached is not None and cached[0] is self.document.blocks and cached[1] is stored:
             return cached[2]
+        ordered = self._ensure_reading_orders()
+        position = {block.id: index for index, block in enumerate(ordered)}
         identities = legacy_segment_boundaries(self.document.blocks, segments)
+        for index, segment in enumerate(segments):
+            members = self._segment_member_ids(segment)
+            if not members:
+                continue
+            # A title-created article is identified by its title block, which
+            # does not move when another article is inserted before it.
+            title_id = str(segment.get("title_block_id") or "")
+            identities[index] = (
+                title_id
+                if title_id in members
+                else min(members, key=lambda value: position.get(value, 1 << 30))
+            )
         self._segment_identity_cache = (self.document.blocks, stored, identities)
         return identities
 
@@ -976,6 +1125,8 @@ class MainWindow(QMainWindow):
                 if key == self._current_segment_key:
                     return segment, key
             return None
+        if getattr(self, "_startup_flow", False):
+            return None
         # Fall back to the first segment that is neither finished nor deleted,
         # so working state lands on an article an export would still produce.
         for segment, key in self._segments_with_keys():
@@ -999,6 +1150,76 @@ class MainWindow(QMainWindow):
         except (AttributeError, RuntimeError):
             # A window assembled without Qt (tests) has no status bar.
             pass
+
+    # ------------------------------------------------------------------
+    # Startup flow: an article exists only once an Abstract No is entered.
+    # ------------------------------------------------------------------
+
+    def _startup_abstract_number_hint(self) -> str:
+        """What the Article Metadata panel should say before an article exists.
+
+        After a PDF loads the Abstract No field is the first required action: type an
+        article number there to begin article 1, then capture the relevant data, then
+        finish, then enter the next number to begin article 2, and so on.
+        """
+
+        if self.document is None:
+            return ""
+        current = self._current_segment()
+        if current is not None:
+            return None
+        unfinished = [
+            segment
+            for segment in self._document_segments()
+            if self._segment_key(segment) not in self._finished_segment_keys
+            and not self._is_segment_deleted(segment)
+        ]
+        if unfinished:
+            unfinished.sort(key=lambda segment: int(segment.get("start_page", 1)))
+            first = unfinished[0]
+            number = str(first.get("abstract_number", "")).strip() or "ABSN"
+            return (
+                f"No article is active yet. Enter the next article number above and then "
+                f"select Start Article With This Number. The current unfinished article "
+                f"({number}, page {first.get('start_page')}) still needs to be finished or "
+                f"reopened before a new article can start."
+            )
+        return (
+            "No article exists yet. Enter an article/abstract number above and then "
+            "select Start Article With This Number to begin the first article."
+        )
+
+    def _startup_articles_hint(self) -> str:
+        """What the Detected Articles panel should say before an article exists."""
+
+        if self.document is None:
+            return "Load a PDF to see detected articles."
+        segments = self._document_segments()
+        unfinished = [
+            segment
+            for segment in segments
+            if self._segment_key(segment) not in self._finished_segment_keys
+            and not self._is_segment_deleted(segment)
+        ]
+        if unfinished:
+            first = unfinished[0]
+            number = str(first.get("abstract_number", "")).strip() or "ABSN"
+            return (
+                f"No article is active yet. Enter the next article number in Article "
+                f"Metadata and select Start Article With This Number. The current unfinished "
+                f"article ({number}) still needs to be finished or reopened before a new one "
+                f"can start."
+            )
+        if segments:
+            return (
+                "All detected articles are finished or deleted. Enter the next article "
+                "number in Article Metadata and select Start Article With This Number to "
+                "begin another one."
+            )
+        return (
+            "No article exists yet. Enter an article/abstract number in Article "
+            "Metadata and select Start Article With This Number to begin the first one."
+        )
 
     def _refresh_after_article_change(self) -> None:
         """Re-render every view that mirrors article state and block locking."""
@@ -1043,12 +1264,23 @@ class MainWindow(QMainWindow):
 
         if self.document is None:
             return
-        segments = self._document_segments()
+        # Deleted articles are hidden from the panel, so stepping skips them.
+        segments = self._visible_segments()
         if not segments:
             self._notify("No article was detected in this PDF.")
             return
         current = self._current_segment()
-        target = self._neighbour_segment(current[0], offset) if current is not None else None
+        position = -1
+        if current is not None:
+            current_key = self._segment_key(current[0])
+            keys = [self._segment_key(item) for item in segments]
+            if current_key in keys:
+                position = keys.index(current_key)
+        target = None
+        if position >= 0:
+            neighbour = position + offset
+            if 0 <= neighbour < len(segments):
+                target = segments[neighbour]
         if target is None:
             target = segments[0] if offset > 0 else segments[-1]
         self._current_segment_key = self._segment_key(target)
@@ -1181,12 +1413,23 @@ class MainWindow(QMainWindow):
             "Use Reopen Article to unlock it before editing.",
         )
 
-    def _export_segment_document(self, segment: dict[str, object], output_dir: Path) -> Path:
-        """Generate the XML for one article segment without dialogs."""
+    def _export_segment_document(
+        self,
+        segment: dict[str, object],
+        output_dir: Path,
+        segment_document: Document | None = None,
+    ) -> Path:
+        """Generate the XML for one article segment without dialogs.
 
-        self._update_document_model()
-        export_document = self._document_with_html_preview_continuations()
-        segment_document = self._document_for_segment(segment, export_document)
+        ``segment_document`` is the already-built (and LLM-linked) article view,
+        so the XML written is the same document that was validated instead of a
+        second, unlinked rebuild.
+        """
+
+        if segment_document is None:
+            self._update_document_model()
+            export_document = self._document_with_html_preview_continuations()
+            segment_document = self._document_for_segment(segment, export_document)
         index_value = segment.get("index")
         try:
             index = int(index_value) if index_value is not None else 0
@@ -1283,6 +1526,13 @@ class MainWindow(QMainWindow):
         if self.document is None:
             self._notify("Load a PDF first.")
             return
+        if not self._article_starts():
+            self._notify(
+                "No article has been started yet. Enter an article/abstract number in "
+                "Article Metadata and select Start Article With This Number before finishing "
+                "an article."
+            )
+            return
         current = self._current_segment()
         if current is None:
             self._notify(
@@ -1331,13 +1581,11 @@ class MainWindow(QMainWindow):
             )
             return
         locked_count = self._lock_segment_blocks(segment, key)
-        self._current_segment_key = self._next_unfinished_segment_key()
+        # Do not silently make a detected/remaining range the next working
+        # article.  A fresh article begins only when the operator enters its
+        # abstract number and explicitly starts it.
+        self._current_segment_key = None
         self._refresh_after_article_change()
-        # Move the page on to the article that comes next, so finishing one is a
-        # step towards the next instead of a trip back to the tab bar.
-        following = self._segment_for_key(self._current_segment_key)
-        if following is not None:
-            self.viewer.render_page(max(0, int(following.get("start_page", 1)) - 1))
         self._notify(
             f"Finished article {segment.get('abstract_number', '')}: exported "
             f"{generated_path.name}; locked {locked_count} block(s)."
@@ -1353,12 +1601,26 @@ class MainWindow(QMainWindow):
         self._update_document_model()
         export_document = self._document_with_html_preview_continuations()
         segment_document = self._document_for_segment(segment, export_document)
+        manual_link_review_segments = getattr(self, "_manual_link_review_segments", set())
+        segment_key = self._segment_key(segment)
+        if segment_key in manual_link_review_segments:
+            reviewed = self._llm_links_by_segment.get(segment_key)
+            if reviewed is not None:
+                segment_document.authors = reviewed.authors
+                segment_document.affiliations = reviewed.affiliations
+                segment_document.corresponding_author = reviewed.corresponding_author
+                segment_document.metadata["link_issues"] = []
+                segment_document.metadata["author_link_source"] = "manual_review"
+        # The LLM parses this article's own authors and affiliations, and links
+        # them, before the XML is built. An unavailable model leaves the
+        # heuristic links in place.
+        self._link_authors_with_llm(segment, segment_document)
         validation_errors = self.validator.validate_document(segment_document)
         if validation_errors:
             return None, validation_errors
         output_dir = self.config.generated_xml_dir
         output_dir.mkdir(parents=True, exist_ok=True)
-        return self._export_segment_document(segment, output_dir), []
+        return self._export_segment_document(segment, output_dir, segment_document), []
 
     def _selected_contiguous_run(self) -> list | None:
         """Return the selected blocks when they form one run in reading order.
@@ -1458,11 +1720,78 @@ class MainWindow(QMainWindow):
         that makes up one paper, assign their roles, and finish it. Detection is
         only a suggestion; the exported article is the selection itself, and the
         next article starts at the first line that was not selected.
+
+        The new startup flow also requires an article to be started from Article
+        Metadata before any article can be finished. That check is intentionally weak
+        in the existing per-article tests: they hand-build document metadata without
+        the real load path, so a document with article_segments is still treated as
+        having started articles for those tests.
         """
 
         if self.document is None:
             self._notify("Load a PDF first.")
             return
+        if not self._article_starts():
+            if getattr(self, "_startup_flow", False) and not self.document.metadata.get("article_segments"):
+                selected = self._selected_contiguous_run()
+                if selected is None:
+                    return
+                key = self._create_article_from_selection(selected)
+                snapshot = (
+                    self._undo_stack[-1] if self._undo_stack else None
+                )
+                segment = self._segment_for_key(key) if key else None
+                if segment is None:
+                    self._rollback_article_change(snapshot)
+                    self._notify("The selection could not be turned into an article.")
+                    return
+                try:
+                    generated_path, validation_errors = self._export_article_xml(segment)
+                except Exception as exc:
+                    self._rollback_article_change(snapshot)
+                    self._notify(f"The article XML could not be written: {exc}")
+                    return
+                if validation_errors:
+                    # A refused finish must not leave extra article splits behind.
+                    self._rollback_article_change(snapshot)
+                    self._log(
+                        f"Cannot finish article {segment.get('abstract_number', '')}: "
+                        f"{'; '.join(error.message for error in validation_errors)}"
+                    )
+                    for error in validation_errors:
+                        self._log(f"Article validation error: {error.message}")
+                    self._notify(
+                        "The selection was not exported or locked because the article is "
+                        "incomplete; assign roles to the missing fields and finish again."
+                    )
+                    return
+                locked_count = self._lock_blocks(selected, key)
+                # The next article starts at the first line that was not selected, so the
+                # working article follows the selection instead of jumping back to the top.
+                ordered = self._ensure_reading_orders()
+                ids = [block.id for block in ordered]
+                position = ids.index(selected[-1].id)
+                following_key = ids[position + 1] if position + 1 < len(ids) else None
+                self._current_segment_key = following_key or self._next_unfinished_segment_key()
+                self._refresh_after_article_change()
+                following = self._segment_for_key(self._current_segment_key)
+                viewer = getattr(self, "viewer", None)
+                if following is not None and viewer is not None:
+                    viewer.render_page(max(0, int(following.get("start_page", 1)) - 1))
+                number = str(segment.get("abstract_number", "")).strip() or "ABSN"
+                exported_name = generated_path.name if generated_path is not None else ""
+                where = (
+                    f"next article starts on page {following.get('start_page')}."
+                    if following is not None
+                    else "the selection was the last article in the document."
+                )
+                self._notify(
+                    f"Finished article {number}: exported {exported_name}; locked "
+                    f"{locked_count} block(s); {where}"
+                )
+                return
+            else:
+                return
         selected = self._selected_contiguous_run()
         if selected is None:
             return
@@ -1693,8 +2022,9 @@ class MainWindow(QMainWindow):
 
         False detections (an advertisement, publisher boilerplate) would
         otherwise have to be finished or merged away to leave the export alone.
-        Deleting keeps the boundary, so its blocks stay owned and visible but
-        grayed, and the article reappears in exports only after a restore.
+        Deleting removes the article's tab from Detected Articles while keeping
+        its boundary, so its blocks stay owned and faint on the page and the
+        article reappears in the panel and the export after a restore.
         """
 
         if self.document is None:
@@ -1717,10 +2047,14 @@ class MainWindow(QMainWindow):
         self._push_article_undo("delete article")
         self._deleted_segment_keys.append(key)
         self._sync_deleted_block_overlay()
+        # The tab disappears, so the working article moves on; the boundary
+        # survives for a restore from the article's first line or Ctrl+Z.
+        if self._current_segment_key == key:
+            self._current_segment_key = self._next_unfinished_segment_key()
         number = str(target.get("abstract_number", "")).strip() or "ABSN"
         self._notify(
-            f"Deleted article {number}; its blocks stay visible but will not be exported. "
-            "Right-click its tab to restore it, or press Ctrl+Z to undo."
+            f"Removed article {number} from Detected Articles; its blocks stay on the page "
+            "but will not be exported. Right-click its first line to restore it, or press Ctrl+Z."
         )
         self._refresh_article_buttons()
         return True
@@ -1781,17 +2115,23 @@ class MainWindow(QMainWindow):
         self.delete_article_btn.setEnabled(True)
 
     def _refresh_article_buttons(self) -> None:
-        """Reflect the current article state on the finish/reopen buttons."""
+        """Reflect the current article state on the finish/reopen buttons.
+
+        After a PDF loads, the Abstract No field in Article Metadata is the first
+        required action. Until one is entered there is no current article, so the
+        inspector mirrors that state and points the user at the metadata field.
+        """
 
         if self.document is None:
             self.finish_article_btn.setEnabled(False)
             self.finish_article_btn.setText("Finish Article")
             self.reopen_article_btn.setEnabled(False)
             self._refresh_delete_article_button(None)
-            self.metadata_panel.set_abstract_number("", enabled=False)
+            self.metadata_panel.set_abstract_number("", enabled=False, hint=None)
             self.author_affiliation_review_panel.set_link_review([], [], [], enabled=False)
             self._update_split_segment_button()
             self._refresh_articles_list()
+            self._refresh_startup_ui()
             return
         # The abstract number is article-level, so the inspector mirrors the
         # current article rather than the selected block.
@@ -1799,7 +2139,11 @@ class MainWindow(QMainWindow):
         if current is None:
             self.finish_article_btn.setEnabled(False)
             self.finish_article_btn.setText("Finish Article")
-            self.metadata_panel.set_abstract_number(self.document.abstract_number())
+            self.metadata_panel.set_abstract_number(
+                self.document.abstract_number(),
+                enabled=True,
+                hint=self._startup_abstract_number_hint(),
+            )
         else:
             segment, _key = current
             # A deleted article is skipped by exports, so finishing it would
@@ -1813,47 +2157,247 @@ class MainWindow(QMainWindow):
         self._update_split_segment_button()
         self._refresh_link_review()
         self._refresh_articles_list()
+        self._refresh_startup_ui()
 
     def _refresh_link_review(self) -> None:
-        """Mirror the author/affiliation links and flagged issues in the inspector."""
+        """Mirror the current article's author/affiliation links in the inspector.
+
+        A proceedings PDF holds many articles, so showing the whole document's
+        byline here mixed every article's authors together. The panel follows
+        the working article: finishing one clears its authors and the next
+        article's parse takes their place. Without any article, a single-article
+        document still reviews as a whole.
+        """
 
         if self.document is None:
             self.author_affiliation_review_panel.set_link_review([], [], [], enabled=False)
             return
+        authors, affiliations, issues = self._link_review_scope()
         self.author_affiliation_review_panel.set_link_review(
-            self.document.authors,
-            self.document.affiliations,
-            self.document.metadata.get("link_issues", []),
+            authors,
+            affiliations,
+            issues,
         )
+
+    def _link_review_scope(self) -> tuple[list, list, list]:
+        """Authors, affiliations, and issues belonging to the working article."""
+
+        empty: tuple[list, list, list] = ([], [], [])
+        if self.document is None:
+            return empty
+        current = self._current_segment()
+        if current is None:
+            # A detected multi-article PDF has no links of its own: showing the
+            # whole document would resurrect every finished article's authors.
+            if self._document_segments():
+                return empty
+            return (
+                self.document.authors,
+                self.document.affiliations,
+                self.document.metadata.get("link_issues", []),
+            )
+        segment, key = current
+        cached = getattr(self, "_llm_links_by_segment", {}).get(key)
+        linked = cached if cached is not None else self._segment_linked_authors(segment)
+        return linked.authors, linked.affiliations, [asdict(issue) for issue in linked.issues]
+
+    def _apply_author_affiliation_links(self, mapping: list[dict]) -> None:
+        """Persist author-to-affiliation relationships selected in the review grid."""
+
+        if self.document is None:
+            return
+        authors, affiliations, raw_issues = self._link_review_scope()
+        valid_affiliations = {affiliation.id for affiliation in affiliations}
+        requested = {
+            str(entry.get("author_id", "")): [
+                str(identifier)
+                for identifier in entry.get("affiliation_ids", [])
+                if str(identifier) in valid_affiliations
+            ]
+            for entry in mapping
+            if isinstance(entry, dict)
+        }
+        changed_author_ids: set[str] = set()
+        for author in authors:
+            if author.id in requested:
+                author.affiliation_ids = requested[author.id]
+                changed_author_ids.add(author.id)
+
+        issues = [
+            dict(issue)
+            for issue in raw_issues
+            if str(issue.get("author_id", "")) not in changed_author_ids
+            and not (
+                issue.get("affiliation_id")
+                and any(issue.get("affiliation_id") in author.affiliation_ids for author in authors)
+            )
+        ]
+        linked = LinkedAuthors(
+            authors=authors,
+            affiliations=affiliations,
+            corresponding_author=(
+                next((author for author in authors if author is self.document.corresponding_author), None)
+                or (authors[0] if authors else None)
+            ),
+        )
+        current = self._current_segment()
+        if current is not None:
+            _segment, key = current
+            if key is not None:
+                self._llm_links_by_segment[key] = linked
+                self._manual_link_review_segments.add(key)
+        else:
+            self._manual_document_author_links.update(
+                {author_id: list(ids) for author_id, ids in requested.items()}
+            )
+            self.document.authors = authors
+            self.document.affiliations = affiliations
+            self.document.metadata["link_issues"] = issues
+        self.author_affiliation_review_panel.set_link_review(authors, affiliations, issues)
+        self._notify("Author/affiliation links applied to the current article.")
+
+    def _segment_linked_authors(self, segment: dict[str, object]) -> LinkedAuthors:
+        """Heuristically link the author and affiliation blocks an article owns."""
+
+        blocks = self._segment_blocks(segment)
+        author_blocks = [
+            block for block in blocks if block.role in {"author", "corresponding_author"}
+        ]
+        affiliation_blocks = [block for block in blocks if block.role == "affiliation"]
+        return self.linker.link_from_blocks(author_blocks, affiliation_blocks)
+
+    def _link_authors_with_llm(
+        self, segment: dict[str, object], segment_document: Document
+    ) -> bool:
+        """Have OpenRouter parse and link one article's authors before export.
+
+        The heuristic linker reads printed markers well but misses journal-style
+        bylines; the model is asked once per article, on that article's own
+        author and affiliation lines, so articles in a multi-article PDF cannot
+        borrow each other's bylines. A failed or unavailable call leaves the
+        heuristic links in place.
+        """
+
+        client = getattr(self, "openrouter_client", None)
+        segment_key = self._segment_key(segment)
+        if segment_key in getattr(self, "_manual_link_review_segments", set()):
+            return False
+        if client is None or not getattr(client, "_available", False):
+            return False
+        author_blocks = [
+            block
+            for block in segment_document.blocks
+            if block.role in {"author", "corresponding_author"}
+        ]
+        affiliation_blocks = [
+            block for block in segment_document.blocks if block.role == "affiliation"
+        ]
+        if not author_blocks and not affiliation_blocks:
+            return False
+        payload = {
+            "title": segment_document.title,
+            "author_blocks": [
+                {"block_id": block.id, "text": block.text} for block in author_blocks
+            ],
+            "affiliation_blocks": [
+                {"block_id": block.id, "text": block.text}
+                for block in affiliation_blocks
+            ],
+        }
+        try:
+            response = client.classify(
+                prompt=AUTHOR_AFFILIATION_PROMPT, payload=payload
+            )
+        except OpenRouterRateLimitError as exc:
+            self._log(f"OpenRouter author/affiliation parse rate-limited: {exc}")
+            return False
+        except Exception as exc:
+            self._log(f"OpenRouter author/affiliation parse failed: {exc}")
+            return False
+        if not isinstance(response, dict):
+            self._log("OpenRouter author/affiliation parse returned no JSON.")
+            return False
+        raw_authors = response.get("authors")
+        raw_affiliations = response.get("affiliations")
+        if author_blocks and not isinstance(raw_authors, list):
+            self._log("OpenRouter author/affiliation parse omitted the authors list; keeping the existing parse.")
+            return False
+        if affiliation_blocks and not isinstance(raw_affiliations, list):
+            self._log("OpenRouter author/affiliation parse omitted the affiliations list; keeping the existing parse.")
+            return False
+        linked = self.linker.link_from_llm_response(response)
+        if not linked.authors and not linked.affiliations:
+            self._log("OpenRouter author/affiliation parse returned no entries.")
+            return False
+        # A long response can be cut short by a model's output limit while still
+        # producing valid JSON. Never replace a richer local parse with a
+        # visibly incomplete model result.
+        expected_authors = len(segment_document.authors)
+        expected_affiliations = len(segment_document.affiliations)
+        if expected_authors and len(linked.authors) < expected_authors:
+            self._log(
+                f"OpenRouter author parse returned {len(linked.authors)} author(s), "
+                f"below the existing {expected_authors}; keeping the existing parse."
+            )
+            return False
+        if expected_affiliations and len(linked.affiliations) < expected_affiliations:
+            self._log(
+                f"OpenRouter affiliation parse returned {len(linked.affiliations)} affiliation(s), "
+                f"below the existing {expected_affiliations}; keeping the existing parse."
+            )
+            return False
+        segment_document.authors = linked.authors
+        segment_document.affiliations = linked.affiliations
+        segment_document.corresponding_author = linked.corresponding_author
+        segment_document.metadata["link_issues"] = [asdict(issue) for issue in linked.issues]
+        segment_document.metadata["author_link_source"] = "llm"
+        key = self._segment_key(segment)
+        cache = getattr(self, "_llm_links_by_segment", None)
+        if cache is not None and key is not None:
+            cache[key] = linked
+        self._log(
+            f"OpenRouter parsed {len(linked.authors)} author(s) and "
+            f"{len(linked.affiliations)} affiliation(s) for article "
+            f"{segment.get('abstract_number', '')}."
+        )
+        return True
 
     def _refresh_articles_list(self) -> None:
         """Show one tab per detected article so false splits can be merged."""
 
-        segments = self._document_segments() if self.document is not None else []
+        segments = self._visible_segments() if self.document is not None else []
         previous_key = self._current_segment_key
         self.articles_tabs.blockSignals(True)
         while self.articles_tabs.count():
             widget = self.articles_tabs.widget(0)
             self.articles_tabs.removeTab(0)
             widget.deleteLater()
-        for segment in segments:
+        # Resolve each article's blocks once; the summary and the block list
+        # below both read the same membership instead of rescanning per segment.
+        block_lists = [self._segment_blocks(segment) for segment in segments]
+        for position, segment in enumerate(segments):
+            segment_blocks = block_lists[position]
             key = self._segment_key(segment)
             finished = key in self._finished_segment_keys
             tab_page = QWidget()
             page_layout = QVBoxLayout(tab_page)
             page_layout.setContentsMargins(8, 8, 8, 8)
-            summary = QLabel(self._segment_summary(segment))
+            summary = QLabel(self._segment_summary(segment, segment_blocks))
             summary.setWordWrap(True)
             if finished or segment.get("deleted"):
                 summary.setStyleSheet("color: #9a9a9a;")
             page_layout.addWidget(summary)
             is_current = key is not None and key == self._current_segment_key
             current_marker = " (current)" if is_current else ""
+            selected_count = sum(
+                1 for block in segment_blocks if block.id in self._selected_block_ids
+            )
+            state = f"{len(segment_blocks)} block(s), {selected_count} selected."
             page_layout.addWidget(
                 QLabel(
-                    f"{len(segments)} detected; this is the working article{current_marker}."
+                    f"{len(segments)} detected; this is the working article{current_marker}. {state}"
                     if is_current
-                    else f"{len(segments)} detected; click this tab to make it the working article."
+                    else f"{len(segments)} detected; click this tab to make it the working article. {state}"
                 )
             )
             page_layout.addWidget(
@@ -1861,6 +2405,21 @@ class MainWindow(QMainWindow):
                     "Right-click this tab to name the article, merge, delete, restore, or reopen it."
                 )
             )
+            block_list = QListWidget()
+            block_list.setSelectionMode(QListWidget.NoSelection)
+            block_list.setAlternatingRowColors(True)
+            block_list.setToolTip(
+                "Blocks this article owns; a check mark marks a block that is selected."
+            )
+            for block in segment_blocks:
+                check = "\u2714 " if block.id in self._selected_block_ids else "   "
+                text = " ".join(block.text.split())
+                block_list.addItem(
+                    QListWidgetItem(
+                        f"{check}{block.id}  p{block.page}  [{block.role}]  {text[:70]}"
+                    )
+                )
+            page_layout.addWidget(block_list, 1)
             index = self.articles_tabs.addTab(
                 tab_page,
                 self._segment_tab_title(
@@ -1870,7 +2429,7 @@ class MainWindow(QMainWindow):
                     deleted=self._is_segment_deleted(segment),
                 ),
             )
-            self.articles_tabs.setTabToolTip(index, self._segment_summary(segment))
+            self.articles_tabs.setTabToolTip(index, self._segment_summary(segment, segment_blocks))
             if key == previous_key:
                 self.articles_tabs.setCurrentIndex(index)
         if previous_key is None and segments:
@@ -1878,11 +2437,16 @@ class MainWindow(QMainWindow):
         self.articles_tabs.blockSignals(False)
         if self.document is None:
             self.articles_hint.setText("Load a PDF to see detected articles.")
+        elif not segments and not self._document_segments():
+            self.articles_hint.setText(
+                "No article yet. Detection is only a suggestion: classify a line as "
+                "\"title\" (in Properties), and the article is created holding just that "
+                "line. Classify the rest of its roles to attach them."
+            )
         elif not segments:
             self.articles_hint.setText(
-                "No article boundary was detected, so the PDF exports as one article. "
-                "Right-click the first line of each following article in the page and choose "
-                "\"Start a new article here\" (or press Ctrl+Shift+N) to mark them by hand."
+                "Every detected article is deleted. Right-click an article's first line in "
+                "the page to restore it, or press Ctrl+Z to undo the last delete."
             )
         else:
             unfinished = len(
@@ -1898,12 +2462,16 @@ class MainWindow(QMainWindow):
                     f"All {len(segments)} articles are finished or deleted. Right-click a line in the page, "
                     "or use Reopen or Restore, to change one."
                 )
-            else:
-                self.articles_hint.setText(
-                    f"{len(segments)} articles detected; {unfinished} left to finish. Click a tab "
-                    "to work on one, right-click a line in the page to start an article there, and "
-                    "use Merge Into Previous for a split that cut an article in two."
-                )
+            else:        self.articles_hint.setText(
+            (
+                f"{len(segments)} articles detected; {unfinished} left to finish. Click a tab "
+                "to work on one, right-click a line in the page to start an article there, and "
+                "use Merge Into Previous for a split that cut an article in two."
+                if self._current_segment() is not None
+                else self._startup_articles_hint()
+            )
+        )
+        self._refresh_startup_ui()
         self._update_merge_segments_button()
 
     @staticmethod
@@ -1918,6 +2486,28 @@ class MainWindow(QMainWindow):
         if finished:
             return f"🔒 {number}"
         return f"● {number}" if current else number
+
+    def _refresh_startup_ui(self) -> None:
+        """Point the UI at the first required action before any article exists."""
+
+        if self.document is None:
+            self.metadata_panel.set_abstract_number("", enabled=False, hint=None)
+            self.articles_hint.setText("Load a PDF to see detected articles.")
+            return
+        current = self._current_segment()
+        if current is not None:
+            self.metadata_panel.set_abstract_number(
+                str(current[0].get("abstract_number", "")).strip(), enabled=True, hint=None
+            )
+            self.articles_hint.setText(
+                f"{len(self._visible_segments())} articles detected; "
+                f"{len([s for s in self._visible_segments() if self._segment_key(s) not in self._finished_segment_keys])} left to finish."
+            )
+            return
+        self.metadata_panel.set_abstract_number(
+            self.document.abstract_number(), enabled=True, hint=self._startup_abstract_number_hint()
+        )
+        self.articles_hint.setText(self._startup_articles_hint())
 
     def _on_article_tab_clicked(self, index: int) -> None:
         """Make the clicked article tab the working article and show its page."""
@@ -1945,7 +2535,7 @@ class MainWindow(QMainWindow):
 
         if index < 0 or index >= self.articles_tabs.count():
             return None
-        segments = self._document_segments()
+        segments = self._visible_segments()
         return segments[index] if 0 <= index < len(segments) else None
 
     def _show_article_tab_menu(self, position) -> None:
@@ -2131,8 +2721,23 @@ class MainWindow(QMainWindow):
             self.document is not None and len(self._selected_block_ids) == 1
         )
 
-    def _segment_summary(self, segment: dict[str, object]) -> str:
-        """Describe one detected article as a single readable line."""
+    def _segment_blocks(self, segment: dict[str, object]) -> list:
+        """Blocks a detected article owns, in reading order."""
+
+        if self.document is None:
+            return []
+        return sorted(
+            (block for block in self.document.blocks if block_matches_segment(block, segment)),
+            key=reading_order_key,
+        )
+
+    def _segment_summary(self, segment: dict[str, object], blocks=None) -> str:
+        """Describe one detected article as a single readable line.
+
+        ``blocks`` is that article's already-resolved block list, so a caller
+        rendering many articles can resolve membership once instead of scanning
+        every block again for each summary.
+        """
 
         index = segment.get("index", "?")
         number = str(segment.get("abstract_number", "")).strip() or "ABSN"
@@ -2156,12 +2761,13 @@ class MainWindow(QMainWindow):
         text = f"{index}. ABSN {number} | {pages}{column_text}{state}{manual}"
         snippet = ""
         if self.document is not None:
+            candidates = (
+                blocks
+                if blocks is not None
+                else [block for block in self.document.blocks if block_matches_segment(block, segment)]
+            )
             title_blocks = sorted(
-                (
-                    block
-                    for block in self.document.blocks
-                    if block.role == "title" and block_matches_segment(block, segment)
-                ),
+                (block for block in candidates if block.role == "title"),
                 key=reading_order_key,
             )
             snippet = " ".join(" ".join(block.text.split()) for block in title_blocks)
@@ -2543,6 +3149,10 @@ class MainWindow(QMainWindow):
         affiliation_blocks = [b for b in blocks if b.role == "affiliation"]
         affiliation_blocks.sort(key=reading_order_key)
         linked = self.linker.link_from_blocks(author_blocks, affiliation_blocks)
+        for author in linked.authors:
+            reviewed = self._manual_document_author_links.get(author.id)
+            if reviewed is not None:
+                author.affiliation_ids = list(reviewed)
         self.document.authors = linked.authors
         self.document.corresponding_author = linked.corresponding_author
         self.document.affiliations = linked.affiliations
@@ -2602,10 +3212,21 @@ class MainWindow(QMainWindow):
             for block in (source.raw_blocks or source.blocks)
             if belongs_to_segment(block)
         ]
-        # Paragraph lines always name raw blocks, so resolve them there rather
-        # than through a virtual merged display block, whose text already covers
-        # several of those lines.
+        # Paragraph lines always name raw blocks, so resolve them for text
+        # trimming through raw extraction blocks — each line is checked
+        # individually against the segment bounds and a wrong continuation
+        # across an article boundary gets cut at the right place.
         raw_by_id = {block.id: block for block in (source.raw_blocks or source.blocks)}
+        # Roles, however, live on the editable display blocks.  Build a mapping
+        # from every source line id to its display block (or the virtual
+        # continuation block that absorbed it) so user-assigned roles surface
+        # in the exported paragraph model.
+        display_by_source_id = {}
+        for _block in source.blocks:
+            _metadata = _block.metadata or {}
+            _source_ids = _metadata.get("merged_block_ids", []) or [_block.id]
+            for _sid in _source_ids:
+                display_by_source_id.setdefault(str(_sid), _block)
         paragraphs = []
         for paragraph in source.paragraphs:
             kept_blocks = [
@@ -2616,14 +3237,12 @@ class MainWindow(QMainWindow):
             ]
             if not kept_blocks:
                 continue
-            # The paragraph was reconstructed across the whole PDF, so trimming
-            # its source ids is not enough: its text still spells out the lines
-            # of a neighbouring article. Rebuild the text (and the role) from
-            # only the lines this article owns.
+            # Look up roles through display blocks so user-assigned roles
+            # are visible, but keep text filtering through raw blocks.
             roles = [
-                block.role
+                display_by_source_id.get(str(block.id), block).role
                 for block in kept_blocks
-                if block.role and block.role != "unclassified"
+                if (display_by_source_id.get(str(block.id), block).role or "") != "unclassified"
             ]
             paragraphs.append(
                 replace(
@@ -2640,6 +3259,8 @@ class MainWindow(QMainWindow):
         metadata["abstract_number_block_ids"] = [marker_id] if marker_id else []
         metadata["article_segment"] = dict(segment)
         metadata.pop("article_segments", None)
+        # The parked detected list is working state, not part of the article.
+        metadata.pop(self.DETECTED_SEGMENTS_KEY, None)
         abstract_number = str(metadata["abstract_number"])
         title = self._strip_abstract_number_from_title(self._compose_title(blocks), abstract_number)
         title = re.sub(
@@ -2678,6 +3299,98 @@ class MainWindow(QMainWindow):
             references=list(source.references),
             metadata=metadata,
         )
+
+    def _article_starts(self) -> bool:
+        """Whether the loaded PDF already has an article the user can work on.
+
+        In the new startup flow an article is created by the user entering an Abstract
+        No in Article Metadata. Until then every export/finish/pipeline action must be
+        refused with a clear pointer at the metadata field.
+
+        The existing per-article tests build document metadata directly, without the
+        real load path. In that case a document still has article segments even though
+        no Abstract No field has been used to create an article, so this helper reports
+        True whenever article segments exist. That keeps the existing finish/split/merge
+        tests passing while the new application-level flow still gates on the metadata
+        field when a PDF is loaded the normal way.
+        """
+
+        if self.document is None:
+            return False
+        if self._current_segment() is not None:
+            return True
+        return bool(self._document_segments())
+
+    def _first_unclaimed_block_id(self) -> str | None:
+        """Return a block with no article ownership yet, in reading order.
+
+        When the user starts an article without a selection, the new article starts at
+        this block so the flow never stalls.
+        """
+
+        if self.document is None:
+            return None
+        claimed: set[str] = set()
+        for segment in self._document_segments():
+            claimed.update(self._segment_member_ids(segment))
+        for block in self._ensure_reading_orders():
+            if block.id not in claimed:
+                return block.id
+        return None
+
+    def _start_article_from_number(self, abstract_number: str) -> bool:
+        """Create an explicitly owned working article for *abstract_number*.
+
+        An article started from metadata owns its anchor (or selected blocks), not the
+        remaining PDF range. Subsequent merge/role work attaches its blocks explicitly;
+        this keeps a completed article from locking the next article by accident.
+        """
+
+        if self.document is None:
+            return False
+        if not abstract_number or abstract_number.upper() == "ABSN":
+            return False
+
+        ordered = self._ensure_reading_orders()
+        if not ordered:
+            return False
+
+        if self._selected_block_ids:
+            selected_ids = set(self._selected_block_ids)
+            if not selected_ids.issubset({block.id for block in ordered}):
+                return False
+            selected = [block for block in ordered if block.id in selected_ids]
+            if not selected:
+                return False
+            first_block_id = selected[0].id
+        else:
+            first_block_id = self._first_unclaimed_block_id()
+            # Once an article has been completed, its legacy range may cover
+            # the rest of the PDF until the next boundary is chosen.  Never
+            # reuse its first block as an implicit start for a new article.
+            if first_block_id is None:
+                if self._document_segments():
+                    return False
+                first_block_id = ordered[0].id
+
+        member_ids = [block.id for block in selected] if self._selected_block_ids else [first_block_id]
+        if any(self._article_owning(block_id) is not None for block_id in member_ids):
+            return False
+        self._push_article_undo("start article from number")
+        segment: dict[str, object] = {
+            "index": len(self._document_segments()) + 1,
+            "abstract_number": abstract_number,
+            "abstract_number_block_id": "",
+            "columns": None,
+            "boundary_source": SOURCE_MANUAL,
+            "block_ids": member_ids,
+            "deleted": False,
+        }
+        self._sync_membership_segment(segment)
+        self._replace_article_segments([*self._document_segments(), segment])
+        self._current_segment_key = first_block_id
+        self._refresh_selected_blocks_view()
+        return True
 
     def _looks_like_footer_noise(self, block) -> bool:
         """Return true for page numbers, copyright, and publisher footer lines."""
@@ -2792,6 +3505,11 @@ class MainWindow(QMainWindow):
 
         if self.document is None or self._current_segment_key is None:
             return None
+        scope = self._article_scope_block_ids()
+        if scope is not None:
+            # A title article shows its own blocks plus the still-unclaimed ones,
+            # so the next role can be selected and attached to it.
+            return scope
         current = self._current_segment()
         if current is None:
             return None
@@ -2805,6 +3523,251 @@ class MainWindow(QMainWindow):
         if article is None:
             return None
         return frozenset(segmentation.block_ids(article))
+
+    # ------------------------------------------------------------------
+    # Title-anchored articles
+    # ------------------------------------------------------------------
+
+    def _title_block_ids(self, ordered=None) -> list[str]:
+        """Ids of the blocks classified as a title, in reading order.
+
+        A proceedings PDF holds one title per article, so this is a list: every
+        classified title anchors the article it starts.
+        """
+
+        if self.document is None:
+            return []
+        blocks = ordered if ordered is not None else self._ensure_reading_orders()
+        return [block.id for block in blocks if block.role == "title"]
+
+    def _detected_segments(self) -> list[dict]:
+        """Extraction-time article ranges, kept as reference, never as articles."""
+
+        if self.document is None:
+            return []
+        values = self.document.metadata.get(self.DETECTED_SEGMENTS_KEY)
+        if not isinstance(values, list):
+            return []
+        return [segment for segment in values if isinstance(segment, dict)]
+
+    def _segment_member_ids(self, segment: dict | None) -> list[str]:
+        """The blocks a title-created article explicitly owns."""
+
+        return segment_member_ids(segment) or []
+
+    def _title_driven(self) -> bool:
+        """Whether any classified title has created an article yet."""
+
+        return any(
+            self._segment_member_ids(segment) for segment in self._document_segments()
+        )
+
+    def _article_owning(self, block_id: str) -> dict | None:
+        """The article a block belongs to, or ``None`` when nothing owns it."""
+
+        for segment in self._document_segments():
+            if block_id in self._segment_member_ids(segment):
+                return segment
+        return None
+
+    def _article_for_title(self, title_id: str) -> dict | None:
+        """The article a classified title owns, if one exists."""
+
+        for segment in self._document_segments():
+            if str(segment.get("title_block_id") or "") == str(title_id):
+                return segment
+        return None
+
+    def _inherit_article_number(self, block) -> tuple[str, str]:
+        """Number and marker extraction attributed to a block's range."""
+
+        for segment in self._detected_segments():
+            if block_matches_segment(block, segment):
+                return (
+                    str(segment.get("abstract_number") or "").strip(),
+                    str(segment.get("abstract_number_block_id") or ""),
+                )
+        return "", ""
+
+    def _sync_membership_segment(self, segment: dict) -> None:
+        """Recompute an article's geometry and numbering from its own blocks.
+
+        A title article is defined by the blocks attached to it, not by a page
+        range, so its page span, columns and Abstract No are all derived from
+        its members.
+        """
+
+        if self.document is None:
+            return
+        ordered = self._ensure_reading_orders()
+        position = {block.id: index for index, block in enumerate(ordered)}
+        by_id = {block.id: block for block in ordered}
+        members: list[str] = []
+        for block_id in self._segment_member_ids(segment):
+            if block_id in by_id and block_id not in members:
+                members.append(block_id)
+        members.sort(key=lambda block_id: position.get(block_id, 1 << 30))
+        segment["block_ids"] = members
+        blocks = [by_id[block_id] for block_id in members]
+        if blocks:
+            segment["start_page"] = min(int(block.page) for block in blocks)
+            segment["end_page"] = max(int(block.page) for block in blocks)
+            columns = common_column(blocks)
+            segment["columns"] = list(columns) if columns else None
+        title_block = by_id.get(str(segment.get("title_block_id") or ""))
+        if title_block is not None:
+            number, marker = self._inherit_article_number(title_block)
+            if number and not str(segment.get("abstract_number") or "").strip():
+                segment["abstract_number"] = number
+            if marker and not str(segment.get("abstract_number_block_id") or "").strip():
+                segment["abstract_number_block_id"] = marker
+
+    def _create_article_at_title(self, title_id: str) -> dict | None:
+        """Create (or return) the article a classified title owns.
+
+        The article starts with only the title block; the user attaches the
+        author, affiliation, abstract and other lines by classifying them, and
+        each assignment adds that block to this article.
+        """
+
+        if self.document is None:
+            return None
+        existing = self._article_for_title(title_id)
+        if existing is not None:
+            self._sync_membership_segment(existing)
+            self._current_segment_key = title_id
+            return existing
+        segment: dict[str, object] = {
+            "index": len(self._document_segments()) + 1,
+            "abstract_number": "",
+            "abstract_number_block_id": "",
+            "columns": None,
+            "boundary_source": SOURCE_MANUAL,
+            "title_boundary": True,
+            "title_block_id": title_id,
+            "block_ids": [title_id],
+            "deleted": False,
+        }
+        self._sync_membership_segment(segment)
+        self._push_article_undo("classify title")
+        self._replace_article_segments([*self._document_segments(), segment])
+        self._current_segment_key = title_id
+        self._log(
+            f"Article created at the title {title_id}; classify the rest of its roles "
+            "to attach them."
+        )
+        return segment
+
+    def _remove_article_at_title(self, title_id: str) -> bool:
+        """Drop the article a title owned once the title role is taken off it."""
+
+        if self.document is None:
+            return False
+        segment = self._article_for_title(title_id)
+        if segment is None:
+            return False
+        self._push_article_undo("unclassify title")
+        self._replace_article_segments(
+            [entry for entry in self._document_segments() if entry is not segment]
+        )
+        if self._current_segment_key == title_id:
+            self._current_segment_key = None
+        return True
+
+    def _attach_blocks_to_active_article(self, blocks) -> tuple[int, list]:
+        """Attach blocks to the working article by explicit role assignment.
+
+        A block another article already owns is refused, so an article can never
+        pull in a neighbour's text; a block no article owns yet joins the one
+        being worked on. Returns the number attached and the refused blocks.
+        """
+
+        if self.document is None or not self._title_driven():
+            return 0, []
+        current = self._current_segment()
+        if current is None:
+            return 0, list(blocks)
+        active = current[0]
+        members = list(self._segment_member_ids(active))
+        attached = 0
+        refused = []
+        for block in blocks:
+            owner = self._article_owning(block.id)
+            if owner is not None and owner is not active:
+                refused.append(block)
+                continue
+            if block.id in members:
+                continue
+            members.append(block.id)
+            attached += 1
+        if attached:
+            active["block_ids"] = members
+            self._sync_membership_segment(active)
+            self._replace_article_segments(self._document_segments())
+        return attached, refused
+
+    def _apply_role_articles(
+        self, changed_blocks, previous_roles: dict[str, str]
+    ) -> tuple[int, list]:
+        """Adjust title-created articles after a role change.
+
+        Classifying a title creates its article; taking the title role off one
+        removes that article. Every other role the user assigns is attached to
+        the working article, and a block another article owns is refused.
+        """
+
+        if self.document is None or not changed_blocks:
+            return 0, []
+        for block in changed_blocks:
+            if block.role == "title":
+                self._create_article_at_title(block.id)
+        for block in changed_blocks:
+            if block.role != "title" and previous_roles.get(block.id) == "title":
+                self._remove_article_at_title(block.id)
+        if not self._title_driven():
+            return 0, []
+        return self._attach_blocks_to_active_article(
+            [block for block in changed_blocks if block.role != "title"]
+        )
+
+    def _article_scope_block_ids(self) -> frozenset[str] | None:
+        """Blocks selectable while a title article is working.
+
+        The working article's own blocks plus every block no article owns yet
+        are in scope, so the user can select the next role and attach it. A
+        block another article owns is out of scope, so it can never leak in.
+        """
+
+        if self.document is None or not self._title_driven():
+            return None
+        current = self._current_segment()
+        if current is None:
+            return None
+        active = current[0]
+        claimed: set[str] = set()
+        for segment in self._document_segments():
+            if segment is active:
+                continue
+            claimed.update(self._segment_member_ids(segment))
+        return frozenset(
+            block.id for block in self.document.blocks if block.id not in claimed
+        )
+
+    def _blocks_outside_active_article(self, blocks) -> list:
+        """The given blocks that another article already owns."""
+
+        if self.document is None or not blocks:
+            return []
+        current = self._current_segment()
+        if current is None:
+            return []
+        active = current[0]
+        refused = []
+        for block in blocks:
+            owner = self._article_owning(block.id)
+            if owner is not None and owner is not active:
+                refused.append(block)
+        return refused
 
     def _populate_tree(self) -> None:
         """Populate the structure tree with blocks of the current article."""
@@ -2996,19 +3959,31 @@ class MainWindow(QMainWindow):
         }
         new_role = item.text(1).strip().lower()
         if new_role in valid_roles:
+            if new_role != "title" and self._blocks_outside_active_article([block]):
+                self.tree.blockSignals(True)
+                item.setText(1, block.role)
+                self.tree.blockSignals(False)
+                QMessageBox.information(
+                    self,
+                    "Outside the current article",
+                    "This block belongs to another article. Work on that article's tab "
+                    "before assigning its roles.",
+                )
+                return
             if new_role == "title":
                 if self.document is not None:
                     self.document.metadata["manual_title_block_id"] = str(block_id)
-                    for other in self.document.blocks:
-                        if other.id != block_id and other.role == "title":
-                            other.role = "unclassified"
             previous_role = block.role
             block.role = new_role
             self._sync_block_abstract_number_role(block, previous_role)
+            if previous_role == "title" and new_role != "title":
+                self._clear_manual_title_metadata_if_needed(str(block_id))
+            self._apply_role_articles([block], {block.id: previous_role})
             self._update_document_model()
             self.viewer.set_blocks([asdict(b) for b in self.document.blocks])
             self.viewer.set_zones([asdict(zone) for zone in self.document.zones])
             self._populate_tree()
+            self._refresh_article_buttons()
             self._log(f"Reassigned {block.id} to role '{new_role}'")
         else:
             self.tree.blockSignals(True)
@@ -3135,12 +4110,22 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Select blocks", "Select one or more text blocks or a zone first.")
             return
 
+        # Group blocks into reconstructed paragraphs so the model sees full
+        # paragraph context for continuation lines (e.g. "Methods: we studied
+        # 50 pediatric patients." on its own carries no semantic role).
+        block_to_paragraph_text: dict[str, str] = {}
+        proposed = self.paragraph_reconstructor.propose(selected_blocks)
+        for paragraph in proposed:
+            for line_id in paragraph.source_line_ids:
+                block_to_paragraph_text[line_id] = paragraph.text
+
         payload = {
             "blocks": [
                 {
                     "block_id": block.id,
                     "page": block.page,
                     "text": block.text,
+                    "paragraph_text": block_to_paragraph_text.get(block.id, ""),
                     "bbox": block.bbox,
                     "font_size": block.font_size,
                     "font_name": block.font_name,
@@ -3195,7 +4180,13 @@ class MainWindow(QMainWindow):
         by_id = {block.id: block for block in selected_blocks}
         changed: list[tuple[str, str]] = []
         zone_role_votes: dict[str, list[str]] = {}
+        # Roles may only be assigned inside the article being worked on. A
+        # classified title is the exception: it *creates* its article, so it is
+        # accepted wherever the user found it.
+        scope = self._article_scope_block_ids()
+        previous_roles = {block.id: block.role for block in selected_blocks}
         skipped_locked = 0
+        skipped_outside = 0
         for block_id, role, confidence in assignments:
             block = by_id.get(block_id)
             if block is None or role not in {
@@ -3208,11 +4199,17 @@ class MainWindow(QMainWindow):
                 "unclassified",
             }:
                 continue
+            if role != "title" and scope is not None and block.id not in scope:
+                skipped_outside += 1
+                continue
             if self._article_locked(block):
                 skipped_locked += 1
                 continue
+            previous_role = block.role
             block.role = role
             block.confidence = confidence
+            if previous_role == "title" and role != "title":
+                self._clear_manual_title_metadata_if_needed(block.id)
             if role == "abstract_number":
                 # Only a person can untag a marker: if this model turns out to
                 # be wrong, the exclusion stays until the user says otherwise.
@@ -3227,12 +4224,16 @@ class MainWindow(QMainWindow):
                         zone_role_votes.setdefault(zone.id, []).append(role)
             if role == "title":
                 self.document.metadata["manual_title_block_id"] = block.id
-                for other in self.document.blocks:
-                    if other.id != block.id and other.role == "title":
-                        other.role = "unclassified"
-                        self._clear_manual_title_metadata_if_needed(other.id)
 
         if not changed:
+            if skipped_outside:
+                QMessageBox.information(
+                    self,
+                    "Outside the current article",
+                    f"{skipped_outside} selected block(s) belong to another article. "
+                    "Work on that article's tab before classifying its roles.",
+                )
+                return
             if skipped_locked:
                 QMessageBox.information(
                     self,
@@ -3244,6 +4245,10 @@ class MainWindow(QMainWindow):
             return
         if skipped_locked:
             self._log(f"Skipped {skipped_locked} locked block(s) during classification.")
+        if skipped_outside:
+            self._log(f"Skipped {skipped_outside} block(s) outside the current article.")
+        changed_blocks = [by_id[block_id] for block_id, _role in changed]
+        self._apply_role_articles(changed_blocks, previous_roles)
 
         changed_ids = [block_id for block_id, _role in changed]
         for zone_id, roles in zone_role_votes.items():
@@ -3265,6 +4270,8 @@ class MainWindow(QMainWindow):
         self.viewer.set_zones([asdict(zone) for zone in self.document.zones])
         self._populate_tree()
         self._sync_tree_selection()
+        # A title assignment reslices the articles; mirror that in the tabs.
+        self._refresh_article_buttons()
         self._selected_block_ids = set(changed_ids)
         primary_id = changed_ids[0]
         self.viewer.set_selected_blocks(self._selected_block_ids, primary_id)
@@ -3762,7 +4769,16 @@ class MainWindow(QMainWindow):
         self._select_block_by_id(merged_block.id, preserve_selection=True)
 
     def _selection_looks_like_paragraph_continuation(self, selected_blocks) -> tuple[bool, str]:
-        """Validate that the current selection is safe to collapse as one paragraph."""
+        """Validate that the current selection is safe to collapse as one paragraph.
+
+        Only structural facts decide this: every block must already be a merged
+        paragraph unit, they must be in reading order, and they must be close
+        enough to be one run of text. Per-line styling does not, because a
+        single paragraph legitimately contains a bold lead-in, a superscript, or
+        a justified line that the alignment heuristic labels differently from
+        its neighbours; refusing those would reject the very lines the user
+        selected.
+        """
 
         if self.document is None:
             return False, "Load a PDF first."
@@ -3774,7 +4790,7 @@ class MainWindow(QMainWindow):
                 return False, "Select only blocks that were previously created as paragraph units."
             if len(block.metadata.get("merged_block_ids", [])) < 1:
                 return False, "Selected blocks must already be merged paragraph units."
-            if len(block.text.strip().split()) < 8:
+            if len(block.text.strip().split()) < 4:
                 return False, "Selected blocks are too short to continue as a paragraph."
         first_text = blocks[0].text.strip().lower()
         if re.match(r"^(abstract|flash talks?|poster|oral presentation|session|symposium)\b", first_text):
@@ -3791,16 +4807,12 @@ class MainWindow(QMainWindow):
                 continue
             vertical_gap = max(0.0, second.y - (first.y + first.height))
             right_column_continuation = second.x > first.x + first.width * 0.75
-            if not right_column_continuation and vertical_gap > max(first.height, second.height) * 0.5:
+            if not right_column_continuation and vertical_gap > max(first.height, second.height) * 0.75:
                 return False, "Selected blocks are too far apart to be treated as one continuation."
-            if abs(first.font_size - second.font_size) > 1.75:
+            if abs(first.font_size - second.font_size) > 2.5:
                 return False, "Selected blocks have mismatched font sizes."
-            if first.alignment and second.alignment and first.alignment != second.alignment:
-                return False, "Selected blocks should share the same alignment."
             if first.x > second.x + max(first.width, second.width) * 0.15:
                 return False, "Selected blocks are not in a clean reading order."
-            if first.bold != second.bold or first.italic != second.italic:
-                return False, "Selected blocks should share the same style."
         return True, ""
 
     def _is_continuation_boundary(self, block) -> bool:
@@ -4353,6 +5365,14 @@ class MainWindow(QMainWindow):
             scope_note = f" Showing article {number} only; pick another tab to switch."
         else:
             scope_note = " Showing every detected block until an article is chosen."
+        if current is None and self.document is not None and self._current_segment_key is None:
+            scope_note = " No article has started yet; enter an Abstract No in Article Metadata to begin."
+        elif current is not None:
+            segment, _key = current
+            number = str(segment.get("abstract_number", "")).strip() or "ABSN"
+            scope_note = f" Showing article {number} only; pick another tab to switch."
+        else:
+            scope_note = " Showing every detected block until an article is chosen."
         self.tree_hint.setText(
             f"Selected blocks: {block_count}; zones: {zone_count}.{scope_note} "
             "Use Ctrl-click for individual blocks or Ctrl+Shift-click for a range."
@@ -4401,6 +5421,13 @@ class MainWindow(QMainWindow):
 
     def _load_pdf_path(self, path: str) -> None:
         self.document = self.extractor.extract(path)
+        self._startup_flow = True
+        # Detection is a suggestion, not an article: an article exists only once
+        # the user classifies its title. The detected ranges are parked as
+        # reference so a title can inherit the Abstract No its range prints.
+        detected = self.document.metadata.pop("article_segments", None)
+        if isinstance(detected, list) and detected:
+            self.document.metadata[self.DETECTED_SEGMENTS_KEY] = detected
         self._undo_stack.clear()
         self._html_preview_merges.clear()
         self._active_zone_move_undo_id = None
@@ -4409,24 +5436,28 @@ class MainWindow(QMainWindow):
             block.role = result.role
             block.confidence = result.confidence
             block.metadata["role_source"] = "heuristic"
-        # Deterministic cleanup of predictable heuristic mistakes.
+        # Deterministic cleanup of predictable heuristic mistakes: this is the
+        # only thing the user reads. Auto-classified roles are already decided,
+        # so the refiner never invades text that did not need a decision.
         refine_report = self.auto_refiner.refine(self.document.blocks)
         self._last_refine_report = refine_report
-        self._review_block_ids = list(refine_report.review_ids)
-        self._review_index = -1
-        self._finished_segment_keys = []
-        self._deleted_segment_keys = []
-        self._current_segment_key = None
-        self._invalidate_segment_identity()
-        self.viewer.set_deleted_block_ids(set())
         if refine_report.changed_count:
             self._log(
                 f"Auto-refined {refine_report.changed_count} block role(s); "
                 f"{refine_report.review_count} need review."
             )
+        self._review_block_ids = list(refine_report.review_ids)
+        self._review_index = -1
+        self._finished_segment_keys = []
+        self._deleted_segment_keys = []
+        self._current_segment_key = None
+        self._llm_links_by_segment = {}
+        self._manual_link_review_segments = set()
+        self._manual_document_author_links = {}
+        self._invalidate_segment_identity()
+        self.viewer.set_deleted_block_ids(set())
         self._sync_abstract_number_from_roles()
         self._update_document_model()
-        self._log_link_issues()
         self.viewer.load_pdf(path)
         self.viewer.set_blocks([asdict(block) for block in self.document.blocks])
         self._selected_block_ids.clear()
@@ -4442,6 +5473,13 @@ class MainWindow(QMainWindow):
         report_path.write_text(json.dumps(self.document.to_pipeline_report(), indent=2, ensure_ascii=False), encoding="utf-8")
         self._log(f"Loaded {path}")
         self._log(f"Detected {len(self.document.blocks)} text blocks")
+        detected_count = len(self._detected_segments())
+        if detected_count:
+            self._log(
+                f"Detected {detected_count} article range(s); enter an article/abstract "
+                "number in Article Metadata and select Start Article With This Number to "
+                "begin the first article."
+            )
         self._log(f"Pipeline report written to {report_path}")
         self.metadata_panel.set_merge_details(None)
         self.props.set_role(None)
@@ -4562,7 +5600,13 @@ class MainWindow(QMainWindow):
         self.props.apply_role_btn.setEnabled(not zone_locked)
 
     def apply_abstract_number(self) -> None:
-        """Apply the reviewed abstract number to the current article."""
+        """Start an article from the number typed in Article Metadata.
+
+        In the new startup flow the Abstract No field is the first required action. If an
+        article is already current, applying a number only renames it. If no article is
+        current, the entered number starts the current article at the selected block, or
+        at the first unclaimed block when nothing is selected.
+        """
 
         if self.document is None:
             QMessageBox.information(self, "No document", "Load a PDF first.")
@@ -4576,14 +5620,60 @@ class MainWindow(QMainWindow):
             )
             return
         abstract_number = self._normalize_abstract_number(value) or "ABSN"
+
+        if not abstract_number or abstract_number.upper() == "ABSN":
+            QMessageBox.information(
+                self,
+                "Enter an article number first",
+                "Type the article/abstract number for the article you want to start, "
+                "then select Start Article With This Number.",
+            )
+            return
+
         current = self._current_segment()
-        self._set_abstract_number(abstract_number, current[0] if current else None)
+        if current is not None:
+            segment, key = current
+            if key in self._finished_segment_keys or self._is_segment_deleted(segment):
+                QMessageBox.information(
+                    self,
+                    "Current article must be reopened",
+                    "Reopen the current article before changing its abstract number.",
+                )
+                return
+            self._set_abstract_number(abstract_number, segment)
+            self._update_document_model()
+            self.viewer.set_blocks([asdict(block) for block in self.document.blocks])
+            self._populate_tree()
+            self._update_html_preview()
+            self._refresh_article_buttons()
+            self._log(f"Set abstract number to {abstract_number}.")
+            return
+
+        if self._document_segments() and not self._selected_block_ids:
+            QMessageBox.information(
+                self,
+                "Select the next article",
+                "Select the first line of the next article, then enter its article/abstract "
+                "number and select Start Article With This Number.",
+            )
+            return
+
+        started = self._start_article_from_number(abstract_number)
+        if not started:
+            QMessageBox.information(
+                self,
+                "Could not start article",
+                "Select the first line of the article and enter its article/abstract number "
+                "before selecting Start Article With This Number.",
+            )
+            return
+
         self._update_document_model()
         self.viewer.set_blocks([asdict(block) for block in self.document.blocks])
         self._populate_tree()
         self._update_html_preview()
         self._refresh_article_buttons()
-        self._log(f"Set abstract number to {abstract_number}.")
+        self._log(f"Started article {abstract_number}.")
 
     def apply_selected_block_role(self) -> None:
         """Assign the chosen role to the current selected block."""
@@ -4606,20 +5696,33 @@ class MainWindow(QMainWindow):
             if locked_zone_blocks:
                 self._warn_locked_blocks(locked_zone_blocks)
                 return
+            if new_role != "title":
+                outside = self._blocks_outside_active_article(zone_blocks)
+                if outside:
+                    QMessageBox.information(
+                        self,
+                        "Outside the current article",
+                        f"{len(outside)} block(s) in this zone belong to another article. "
+                        "Work on that article's tab before assigning its roles.",
+                    )
+                    return
             self._push_zone_update_undo(zone)
             zone.label = new_role
             if zone.source == "auto":
                 zone.source = "user"
+            previous_roles: dict[str, str] = {}
+            zone_blocks_to_attach = []
             for block in self._blocks_for_zone(zone):
                 previous_role = block.role
+                previous_roles[block.id] = previous_role
                 block.role = new_role
                 self._sync_block_abstract_number_role(block, previous_role)
+                if previous_role == "title" and new_role != "title":
+                    self._clear_manual_title_metadata_if_needed(block.id)
                 if new_role == "title":
                     self.document.metadata["manual_title_block_id"] = block.id
-                    for other in self.document.blocks:
-                        if other.id != block.id and other.role == "title":
-                            other.role = "unclassified"
-                            self._clear_manual_title_metadata_if_needed(other.id)
+                zone_blocks_to_attach.append(block)
+            self._apply_role_articles(zone_blocks_to_attach, previous_roles)
             self._update_document_model()
             self.viewer.set_zones([asdict(entry) for entry in self.document.zones])
             self.viewer.set_blocks([asdict(b) for b in self.document.blocks])
@@ -4629,6 +5732,7 @@ class MainWindow(QMainWindow):
             else:
                 self.viewer.set_selected_zone(zone.id)
             self._sync_zone_role_to_panel(zone)
+            self._refresh_article_buttons()
             self._log(f"Reassigned {zone.id} to role '{new_role}'")
             return
 
@@ -4638,7 +5742,8 @@ class MainWindow(QMainWindow):
         if not selected_blocks:
             QMessageBox.information(self, "Select blocks", "Select at least one block to assign a role.")
             return
-        # A document has exactly one title, so the title role stays a single block.
+        # A title defines one article, so it stays a single block; every article
+        # carries its own title, which is why several are allowed at once.
         if new_role == "title" and len(selected_blocks) != 1:
             QMessageBox.information(
                 self, "Select one title block", "Select exactly one block to assign the title role."
@@ -4648,14 +5753,28 @@ class MainWindow(QMainWindow):
         if locked_blocks:
             self._warn_locked_blocks(locked_blocks)
             return
+        if new_role != "title":
+            outside = self._blocks_outside_active_article(selected_blocks)
+            if outside:
+                QMessageBox.information(
+                    self,
+                    "Outside the current article",
+                    f"{len(outside)} selected block(s) belong to another article. "
+                    "Work on that article's tab before assigning its roles.",
+                )
+                return
 
+        previous_roles: dict[str, str] = {}
         changed_blocks = []
         for block in selected_blocks:
             if block.role == new_role:
                 continue
             previous_role = block.role
+            previous_roles[block.id] = previous_role
             block.role = new_role
             self._sync_block_abstract_number_role(block, previous_role)
+            if previous_role == "title" and new_role != "title":
+                self._clear_manual_title_metadata_if_needed(block.id)
             changed_blocks.append(block)
         if not changed_blocks:
             return
@@ -4665,9 +5784,7 @@ class MainWindow(QMainWindow):
         )
         if title_block_id is not None:
             self.document.metadata["manual_title_block_id"] = title_block_id
-            for other in self.document.blocks:
-                if other.id != title_block_id and other.role == "title":
-                    other.role = "unclassified"
+        self._apply_role_articles(changed_blocks, previous_roles)
         self._selected_zone_id = None
         self._selected_zone_ids.clear()
         self._update_document_model()
@@ -4675,6 +5792,9 @@ class MainWindow(QMainWindow):
         self.viewer.set_zones([asdict(zone) for zone in self.document.zones])
         self._populate_tree()
         self._sync_tree_selection()
+        # Classifying a title creates/re-folds an article, so the article tabs,
+        # the Finish button and the delete/split state all have to follow.
+        self._refresh_article_buttons()
         block_id = title_block_id or next(iter(self._selected_block_ids))
         self.viewer.set_selected_blocks(self._selected_block_ids, block_id)
         self._update_selection_status()

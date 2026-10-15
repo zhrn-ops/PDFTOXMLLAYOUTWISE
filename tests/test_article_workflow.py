@@ -13,6 +13,7 @@ from pdf_to_jats.models.document import (
     block_matches_segment,
     segment_is_manual,
 )
+from pdf_to_jats.models.paragraph import Paragraph
 
 
 def _block(
@@ -176,6 +177,25 @@ def test_shared_column_falls_back_to_page_range_matching():
     assert segments[1]["columns"] is None
 
 
+def test_session_style_codes_wm1_1_wm1_2_produce_correct_segments():
+    """Session-style abstract codes like 'WM1.1' must be detected as markers."""
+
+    extractor = PDFExtractor(use_docling=False)
+    blocks = [
+        _block("WM1.1 Some Abstract Title", block_id="block_a", column=0),
+        _block("WM1.2 Another Abstract Title", block_id="block_b", column=1),
+    ]
+    markers = extractor._extract_abstract_numbers(blocks)
+    assert len(markers) == 2
+    assert markers[0]["abstract_number"] == "WM1.1"
+    assert markers[1]["abstract_number"] == "WM1.2"
+
+    segments = extractor._build_article_segments(markers, page_count=1)
+    assert len(segments) == 2
+    assert segments[0]["columns"] == [0]
+    assert segments[1]["columns"] == [1]
+
+
 def test_html_preview_continuation_keeps_source_ids_for_article_export():
     """A virtual continuation must retain segment membership of its source."""
 
@@ -194,11 +214,30 @@ def test_html_preview_continuation_keeps_source_ids_for_article_export():
     continued[0].role = "abstract"
     window.linker = AuthorLinker()
     window.document = None
+    # Simulate the accepted paragraph that ParagraphReconstructor.accepted_from_blocks
+    # would create from the virtual block: it carries the source line ids and the
+    # user-assigned role.
+    accepted_paragraph = Paragraph(
+        id="paragraph_left",
+        page=1,
+        column=0,
+        text="First half Second half",
+        bbox=[0, 0, 270, 20],
+        source_line_ids=["left", "right"],
+        role="abstract",
+        status="accepted",
+    )
     exported = window._document_for_segment(
         _segment(columns=[1]),
-        Document(blocks=continued, raw_blocks=[left, right]),
+        Document(
+            blocks=continued,
+            raw_blocks=[left, right],
+            paragraphs=[accepted_paragraph],
+        ),
     )
     assert exported.abstract == "First half Second half"
+    # The continuation paragraph must inherit the user-assigned "abstract" role,
+    # not be left as "unclassified" from the raw extraction blocks.    assert exported.paragraphs[0].role == "abstract"
 
 
 def _window(document: Document) -> MainWindow:
@@ -209,6 +248,7 @@ def _window(document: Document) -> MainWindow:
     window._current_segment_key = None
     window._finished_segment_keys = []
     window._deleted_segment_keys = []
+    window._llm_links_by_segment = {}
     window._segment_identity_cache = None
     window._undo_stack = []
     # The articles are re-rendered into the real widgets only in a live window.
@@ -755,6 +795,7 @@ def _finishable_window(document: Document, output) -> MainWindow:
     window._export_article_xml = lambda segment: (output / "article.xml", [])
     window._refresh_after_article_change = lambda: None
     window._warn_locked_blocks = lambda blocks: None
+    window._startup_flow = True
     return window
 
 
@@ -766,6 +807,7 @@ def _headless_window(document: Document) -> MainWindow:
     window._selected_zone_ids = set()
     window._update_document_model = lambda: None
     window._populate_tree = lambda: None
+    window._refresh_article_buttons = lambda: None
     window._sync_tree_selection = lambda: None
     window._update_selection_status = lambda: None
     window._update_selection_panel = lambda: None
@@ -1021,3 +1063,466 @@ def test_role_assignment_applies_to_a_multi_block_selection():
     assert by_id["block_002"].role == "abstract"
     assert by_id["block_003"].role == "abstract"
     assert by_id["block_001"].role != "abstract"
+
+
+def _titled_window() -> tuple[MainWindow, Document]:
+    """A window over the stacked page, ready to classify titles by hand."""
+
+    document = _stacked_page_document()
+    window = _headless_window(document)
+    window.props = SimpleNamespace(role_editor=SimpleNamespace(currentText=lambda: "title"))
+    return window, document
+
+
+def test_a_classified_title_creates_the_article_it_owns():
+    """Classifying a title is the moment the article is created.
+
+    The article starts as exactly the title block: the user then attaches the
+    rest of the roles, and nothing else is pulled in.
+    """
+
+    window, document = _titled_window()
+    window._selected_block_ids = {"block_004"}
+
+    window.apply_selected_block_role()
+
+    by_id = {block.id: block for block in document.blocks}
+    assert by_id["block_004"].role == "title"
+    segments = document.metadata["article_segments"]
+    assert len(segments) == 1
+    assert window._segment_key(segments[0]) == "block_004"
+    assert window._segment_member_ids(segments[0]) == ["block_004"]
+    # The article that owns the title is the one the user is now working on.
+    assert window._current_segment_key == "block_004"
+
+
+def test_each_title_is_its_own_article():
+    """Every classified title creates a separate article of its own."""
+
+    window, document = _titled_window()
+    for title_id in ("block_004", "block_007"):
+        window._selected_block_ids = {title_id}
+        window.apply_selected_block_role()
+
+    segments = document.metadata["article_segments"]
+    assert [window._segment_key(segment) for segment in segments] == ["block_004", "block_007"]
+    assert [window._segment_member_ids(segment) for segment in segments] == [
+        ["block_004"],
+        ["block_007"],
+    ]
+    # Working on the title just classified makes its article the active one.
+    assert window._current_segment_key == "block_007"
+
+
+def test_assigning_a_role_attaches_the_block_to_the_active_article():
+    """Roles the user classifies join the working article, block by block."""
+
+    window, document = _titled_window()
+    window._selected_block_ids = {"block_002"}
+    window.apply_selected_block_role()
+    window.props = SimpleNamespace(role_editor=SimpleNamespace(currentText=lambda: "author"))
+
+    window._selected_block_ids = {"block_003"}
+    window.apply_selected_block_role()
+
+    segments = document.metadata["article_segments"]
+    assert len(segments) == 1
+    assert window._segment_member_ids(segments[0]) == ["block_002", "block_003"]
+    by_id = {block.id: block for block in document.blocks}
+    assert by_id["block_003"].role == "author"
+
+
+def test_classifying_a_title_refreshes_the_article_tabs():
+    """Creating an article in the model must update the Detected Articles panel.
+
+    The panel used to keep showing "No article boundary was detected" after a
+    title was classified, with Finish/Split/Delete still disabled, because the
+    role paths never re-rendered the article list.
+    """
+
+    document = _stacked_page_document()
+    window = _headless_window(document)
+    window.props = SimpleNamespace(role_editor=SimpleNamespace(currentText=lambda: "title"))
+    refreshed: list[bool] = []
+    window._refresh_article_buttons = lambda: refreshed.append(True)
+    window._selected_block_ids = {"block_004"}
+
+    window.apply_selected_block_role()
+
+    assert refreshed, "the article panel was not refreshed after classifying a title"
+    assert document.metadata["article_segments"]
+
+
+def test_reclassifying_a_title_away_removes_its_article():
+    """Taking the title role off a block removes the article it owned."""
+
+    window, document = _titled_window()
+    for title_id in ("block_004", "block_007"):
+        window._selected_block_ids = {title_id}
+        window.apply_selected_block_role()
+    assert len(document.metadata["article_segments"]) == 2
+
+    window.props = SimpleNamespace(role_editor=SimpleNamespace(currentText=lambda: "abstract"))
+    window._selected_block_ids = {"block_007"}
+    window.apply_selected_block_role()
+
+    assert len(document.metadata["article_segments"]) == 1
+    by_id = {block.id: block for block in document.blocks}
+    assert by_id["block_007"].role == "abstract"
+
+
+def _two_column_detected_document() -> Document:
+    """A two-article PDF whose detected ranges really separate the columns."""
+
+    blocks = [
+        _block("(S100) First paper", block_id="block_001", column=0, metadata={"reading_order": 1}),
+        _block("First body.", block_id="block_002", column=0, metadata={"reading_order": 2}),
+        _block("(S200) Second paper", block_id="block_003", column=1, metadata={"reading_order": 3}),
+        _block("Second body.", block_id="block_004", column=1, metadata={"reading_order": 4}),
+    ]
+    segments = [
+        {
+            "index": 1,
+            "abstract_number": "S100",
+            "start_page": 1,
+            "end_page": 1,
+            "columns": [0],
+            "abstract_number_block_id": "block_001",
+        },
+        {
+            "index": 2,
+            "abstract_number": "S200",
+            "start_page": 1,
+            "end_page": 1,
+            "columns": [1],
+            "abstract_number_block_id": "block_003",
+        },
+    ]
+    return Document(
+        blocks=blocks,
+        raw_blocks=list(blocks),
+        metadata={"detected_article_segments": segments},
+    )
+
+
+def _title_window_with_two_articles() -> tuple[MainWindow, Document]:
+    """Two title-created articles: block_002 owns one, block_008 the other."""
+
+    window, document = _titled_window()
+    for title_id in ("block_002", "block_008"):
+        window._selected_block_ids = {title_id}
+        window.apply_selected_block_role()
+    return window, document
+
+
+def test_a_title_article_exports_only_its_members():
+    """An article exports exactly the blocks attached to it, nothing else."""
+
+    window, document = _title_window_with_two_articles()
+    window.props = SimpleNamespace(role_editor=SimpleNamespace(currentText=lambda: "abstract"))
+    window._selected_block_ids = {"block_006"}
+    window.apply_selected_block_role()
+    window.linker = AuthorLinker()
+
+    first = window._document_for_segment(window._segment_for_key("block_002"))
+    assert [block.id for block in first.blocks] == ["block_002"]
+
+    second = window._document_for_segment(window._segment_for_key("block_008"))
+    assert [block.id for block in second.blocks] == ["block_006", "block_008"]
+    assert second.title == "GENERATING PATIENT-DERIVED STEM CELLS"
+
+
+def test_a_title_inherits_the_detected_article_number():
+    """A title keeps the Abstract No extraction attributed to its range."""
+
+    document = _two_column_detected_document()
+    window = _headless_window(document)
+    window.props = SimpleNamespace(role_editor=SimpleNamespace(currentText=lambda: "title"))
+    window._selected_block_ids = {"block_003"}
+
+    window.apply_selected_block_role()
+
+    segments = document.metadata["article_segments"]
+    assert [segment["abstract_number"] for segment in segments] == ["S200"]
+
+
+def test_role_assignment_outside_the_current_article_is_refused(monkeypatch):
+    """A block another article owns cannot be reassigned or attached."""
+
+    from PySide6.QtWidgets import QMessageBox
+
+    window, document = _title_window_with_two_articles()
+    # block_008's article is active, so block_002 belongs to its neighbour.
+    window.props = SimpleNamespace(role_editor=SimpleNamespace(currentText=lambda: "abstract"))
+    monkeypatch.setattr(QMessageBox, "information", lambda *args, **kwargs: QMessageBox.Ok)
+
+    window._selected_block_ids = {"block_002"}
+    window.apply_selected_block_role()
+
+    by_id = {block.id: block for block in document.blocks}
+    assert by_id["block_002"].role != "abstract"
+    assert window._segment_member_ids(document.metadata["article_segments"][0]) == ["block_002"]
+
+
+def test_role_assignment_inside_the_current_article_is_allowed(monkeypatch):
+    """An unclaimed block joins the working article when its role is assigned."""
+
+    from PySide6.QtWidgets import QMessageBox
+
+    window, document = _title_window_with_two_articles()
+    window.props = SimpleNamespace(role_editor=SimpleNamespace(currentText=lambda: "affiliation"))
+    monkeypatch.setattr(QMessageBox, "information", lambda *args, **kwargs: QMessageBox.Ok)
+
+    window._selected_block_ids = {"block_006"}
+    window.apply_selected_block_role()
+
+    by_id = {block.id: block for block in document.blocks}
+    assert by_id["block_006"].role == "affiliation"
+    owner = window._article_owning("block_006")
+    assert owner is not None and window._segment_member_ids(owner) == ["block_006", "block_008"]
+
+
+def test_the_scope_restriction_only_covers_a_title_driven_document():
+    """Without a classified title there are no articles to confine roles to."""
+
+    document = _stacked_page_document()
+    window = _window(document)
+
+    assert window._article_scope_block_ids() is None
+    assert window._blocks_outside_active_article(document.blocks) == []
+
+
+def test_segment_blocks_lists_only_each_articles_own_blocks():
+    """The Detected Articles list shows one article's blocks, not the document's."""
+
+    document = Document(
+        blocks=[
+            _block("First article body.", block_id="block_001", page=1, metadata={"reading_order": 1}),
+            _block("Second article body.", block_id="block_002", page=2, metadata={"reading_order": 2}),
+        ],
+        raw_blocks=[],
+        metadata={
+            "article_segments": [
+                {"index": 1, "abstract_number": "S1", "start_page": 1, "end_page": 1, "columns": None},
+                {"index": 2, "abstract_number": "S2", "start_page": 2, "end_page": 2, "columns": None},
+            ]
+        },
+    )
+    window = _window(document)
+
+    segments = document.metadata["article_segments"]
+    assert [
+        [block.id for block in window._segment_blocks(segment)] for segment in segments
+    ] == [["block_001"], ["block_002"]]
+
+
+def test_deleting_an_article_hides_it_from_the_visible_list():
+    """A deleted article's tab must leave Detected Articles, and return on restore."""
+
+    document = _stacked_page_document()
+    window = _window(document)
+    window.split_article_at_block("block_004")
+    window.split_article_at_block("block_007")
+    segments = document.metadata["article_segments"]
+
+    assert len(window._visible_segments()) == 3
+    window.delete_article(segments[1])
+    assert len(window._visible_segments()) == 2
+    assert all(segment is not segments[1] for segment in window._visible_segments())
+    window.restore_article(segments[1])
+    assert len(window._visible_segments()) == 3
+
+
+def test_deleting_the_current_article_moves_the_working_article_on():
+    """With its tab gone, the deleted article cannot stay the working one."""
+
+    document = _stacked_page_document()
+    window = _window(document)
+    window.split_article_at_block("block_004")
+    window.split_article_at_block("block_007")
+    segments = document.metadata["article_segments"]
+    window._current_segment_key = window._segment_key(segments[1])
+
+    window.delete_article(segments[1])
+
+    assert window._current_segment_key == window._segment_key(segments[0])
+
+
+def _two_article_authors_document() -> Document:
+    """One PDF holding two articles, each with its own author and affiliation."""
+
+    blocks = [
+        _block("Jane Doe1", block_id="a1", column=0, metadata={"reading_order": 1}),
+        _block(
+            "1 Alpha University, USA",
+            block_id="f1",
+            column=0,
+            metadata={"reading_order": 2},
+        ),
+        _block("John Smith2", block_id="a2", column=0, metadata={"reading_order": 3}),
+        _block(
+            "2 Beta University, UK",
+            block_id="f2",
+            column=0,
+            metadata={"reading_order": 4},
+        ),
+    ]
+    blocks[0].role = "author"
+    blocks[1].role = "affiliation"
+    blocks[2].role = "author"
+    blocks[3].role = "affiliation"
+    segments = [
+        {
+            "index": 1,
+            "abstract_number": "P-605",
+            "start_page": 1,
+            "end_page": 1,
+            "columns": [0],
+            "start_order": 1,
+            "end_order": 2,
+        },
+        {
+            "index": 2,
+            "abstract_number": "P-606",
+            "start_page": 1,
+            "end_page": 1,
+            "columns": [0],
+            "start_order": 3,
+            "end_order": 4,
+        },
+    ]
+    return Document(
+        blocks=blocks, raw_blocks=list(blocks), metadata={"article_segments": segments}
+    )
+
+
+def test_link_review_shows_only_the_working_articles_authors():
+    """A multi-article PDF must not mix the articles' bylines in the review."""
+
+    document = _two_article_authors_document()
+    window = _window(document)
+    window.linker = AuthorLinker()
+
+    window._current_segment_key = "a1"
+    authors, affiliations, _issues = window._link_review_scope()
+    assert [author.display_name for author in authors] == ["Jane Doe"]
+    assert [affiliation.text for affiliation in affiliations] == ["Alpha University, USA"]
+
+    window._current_segment_key = "a2"
+    authors, affiliations, _issues = window._link_review_scope()
+    assert [author.display_name for author in authors] == ["John Smith"]
+    assert [affiliation.text for affiliation in affiliations] == ["Beta University, UK"]
+
+
+def test_finished_article_authors_leave_the_review_panel():
+    """Once an article is finished its byline must not stay in the review."""
+
+    document = _two_article_authors_document()
+    window = _window(document)
+    window.linker = AuthorLinker()
+    window._finished_segment_keys = ["a1"]
+    window._current_segment_key = None
+
+    # The finished first article is skipped; the review moves to the second.
+    authors, _affiliations, _issues = window._link_review_scope()
+    assert [author.display_name for author in authors] == ["John Smith"]
+
+    window._finished_segment_keys = ["a1", "a2"]
+    assert window._link_review_scope() == ([], [], [])
+
+
+class _FakeOpenRouter:
+    """Stand-in LLM client that returns a canned author/affiliation parse."""
+
+    _available = True
+
+    def __init__(self, response: dict) -> None:
+        self.response = response
+        self.calls: list[tuple] = []
+
+    def classify(self, prompt: str, payload: dict) -> dict:
+        self.calls.append((prompt, payload))
+        return self.response
+
+
+def test_llm_parse_and_link_replaces_the_heuristic_links(tmp_path):
+    """Finishing an article links its authors from the model's own parse."""
+
+    document = _two_article_authors_document()
+    window = _finishable_window(document, tmp_path)
+    window.openrouter_client = _FakeOpenRouter(
+        {
+            "authors": [
+                {
+                    "display_name": "Jane Q. Doe",
+                    "given_names": "Jane Q.",
+                    "surname": "Doe",
+                    "initials": "J.Q.",
+                    "markers": ["1"],
+                    "affiliations": ["1"],
+                }
+            ],
+            "affiliations": [{"marker": "1", "text": "Alpha University, USA"}],
+        }
+    )
+
+    segment = window._segment_for_key("a1")
+    segment_document = window._document_for_segment(segment)
+    assert window._link_authors_with_llm(segment, segment_document) is True
+
+    assert [author.display_name for author in segment_document.authors] == ["Jane Q. Doe"]
+    assert segment_document.metadata["author_link_source"] == "llm"
+    assert window._llm_links_by_segment["a1"].authors[0].display_name == "Jane Q. Doe"
+    # The model only ever sees this article's own lines, never its neighbour's.
+    _prompt, payload = window.openrouter_client.calls[0]
+    assert [entry["block_id"] for entry in payload["author_blocks"]] == ["a1"]
+    assert [entry["block_id"] for entry in payload["affiliation_blocks"]] == ["f1"]
+
+
+def test_export_article_xml_validates_and_writes_the_linked_document(tmp_path):
+    """The XML written is the same LLM-linked document that was validated."""
+
+    document = _two_article_authors_document()
+    window = _finishable_window(document, tmp_path)
+    window._html_preview_merges = []
+    window.paragraph_reconstructor = ParagraphReconstructor()
+    window._refresh_link_review = lambda: None
+    window._update_document_model = lambda: None
+    captured: dict = {}
+
+    def fake_validate(doc):
+        captured["document"] = doc
+        return []
+
+    def fake_export(segment, output_dir, segment_document=None):
+        captured["exported"] = segment_document
+        return tmp_path / "article.xml"
+
+    window.validator = SimpleNamespace(validate_document=fake_validate)
+    window._export_segment_document = fake_export
+    window.openrouter_client = _FakeOpenRouter(
+        {
+            "authors": [
+                {
+                    "display_name": "Jane Q. Doe",
+                    "given_names": "Jane Q.",
+                    "surname": "Doe",
+                    "initials": "J.Q.",
+                    "affiliations": ["1"],
+                }
+            ],
+            "affiliations": [{"marker": "1", "text": "Alpha University, USA"}],
+        }
+    )
+    # The stubbed finish path is bypassed so the real export runs.
+    del window._export_article_xml
+
+    segment = window._segment_for_key("a1")
+    _path, validation_errors = window._export_article_xml(segment)
+
+    assert validation_errors == []
+    assert captured["exported"] is captured["document"]
+    assert captured["document"].metadata["author_link_source"] == "llm"
+    assert [author.display_name for author in captured["document"].authors] == [
+        "Jane Q. Doe"
+    ]

@@ -82,3 +82,66 @@ def test_inline_marker_beside_title_text_is_not_a_dedicated_block():
 
     assert not extractor._is_abstract_number_only("(S100) PHASE 3, RANDOMIZED STUDY", "S100")
     assert extractor._is_abstract_number_only("Abstract No: 4349", "4349")
+
+
+def test_session_style_code_is_extracted():
+    number, block_ids = PDFExtractor(use_docling=False)._extract_abstract_number(
+        [_block("WM1.1")]
+    )
+
+    assert number == "WM1.1"
+    assert block_ids == ["block_001"]
+
+
+def test_session_style_code_followed_by_title_is_extracted():
+    number, block_ids = PDFExtractor(use_docling=False)._extract_abstract_number(
+        [_block("WM1.1 Landscape and feasibility of NHS brain tumour whole genome sequencing")]
+    )
+
+    assert number == "WM1.1"
+    assert block_ids == ["block_001"]
+
+
+def test_session_header_with_dot_not_followed_by_digit_is_not_a_marker():
+    # "WM1." is a session header (e.g. "WM1. HOT TOPIC"), not an abstract
+    # number.  The dot must be followed by a digit for the code to match.
+    markers = PDFExtractor(use_docling=False)._extract_abstract_numbers(
+        [_block("WM1. HOT TOPIC", "block_001")]
+    )
+
+    assert markers == []
+
+
+def test_regular_title_lines_are_not_session_codes():
+    markers = PDFExtractor(use_docling=False)._extract_abstract_numbers(
+        [
+            _block("Landscape and feasibility of NHS brain tumour", "block_001"),
+            _block("Objective: Review of patients with glioma", "block_002"),
+            _block("Methods: Data snapshot 30/Apr/2025", "block_003"),
+            _block("Results: For 500 recruited patients", "block_004"),
+            _block("Conclusion: Inequality and logistical challenges", "block_005"),
+        ]
+    )
+
+    assert markers == []
+
+
+def test_multiple_session_codes_are_all_extracted():
+    markers = PDFExtractor(use_docling=False)._extract_abstract_numbers(
+        [
+            _block("WM1.1", "block_001"),
+            _block("WM1.2", "block_002"),
+            _block("WM2.1 Some title", "block_003"),
+        ]
+    )
+
+    assert [marker["abstract_number"] for marker in markers] == ["WM1.1", "WM1.2", "WM2.1"]
+
+
+def test_session_code_is_not_abstract_number_only_when_title_follows():
+    extractor = PDFExtractor(use_docling=False)
+
+    assert not extractor._is_abstract_number_only(
+        "WM1.1 Landscape and feasibility of NHS brain tumour", "WM1.1"
+    )
+    assert extractor._is_abstract_number_only("WM1.2", "WM1.2")

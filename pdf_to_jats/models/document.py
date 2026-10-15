@@ -51,6 +51,23 @@ def segment_is_manual(segment: dict[str, Any] | None) -> bool:
     return start_order is not None or end_order is not None
 
 
+def segment_member_ids(segment: dict[str, Any] | None) -> list[str] | None:
+    """Return the explicit blocks an article owns, or ``None``.
+
+    An article the user created by classifying a title is a set of blocks the
+    user attached to it, not a page range. Only such an article carries
+    ``block_ids``; a detected or hand-split range leaves it unset and is matched
+    geometrically as before.
+    """
+
+    if not segment:
+        return None
+    values = segment.get("block_ids")
+    if not isinstance(values, list) or not values:
+        return None
+    return [str(value) for value in values]
+
+
 def block_matches_segment(block: TextBlock, segment: dict[str, Any] | None) -> bool:
     """Return whether a block belongs to an article segment.
 
@@ -68,6 +85,9 @@ def block_matches_segment(block: TextBlock, segment: dict[str, Any] | None) -> b
 
     if segment is None:
         return False
+    member_ids = segment_member_ids(segment)
+    if member_ids is not None:
+        return str(block.id) in member_ids
     start_page = int(segment.get("start_page", 1))
     end_page = int(segment.get("end_page", start_page))
     if not start_page <= int(block.page) <= end_page:

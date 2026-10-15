@@ -144,3 +144,51 @@ def test_wrapped_affiliation_lines_are_rejoined():
 
     assert len(linked.affiliations) == 1
     assert linked.affiliations[0].text.endswith("South Korea")
+
+
+def test_comma_separated_numbered_affiliations_are_split_and_linked():
+    linked = AuthorLinker().link_from_texts(
+        ["Y. Kim\u00b9, E. Kim\u00b9, M. Kim\u00b9, Y. Kwon\u00b2, B.K. Lee\u00b2, Y. Yoon\u00b2, H.H. Lim\u00b2"],
+        ["\u00b9Division of Pediatric Endocrinology and Metabolism, Department of Pediatrics, Chungnam National University Sejong Hospital, Sejong, South Korea, \u00b2Department of Pediatrics, College of Medicine, Chungnam National University, Daejeon, South Korea"],
+    )
+
+    assert len(linked.affiliations) == 2
+    assert linked.affiliations[0].id == "1"
+    assert linked.affiliations[1].id == "2"
+    assert all(author.affiliation_ids == ["1"] for author in linked.authors[:3])
+    assert all(author.affiliation_ids == ["2"] for author in linked.authors[3:])
+
+
+def test_glued_markers_inside_affiliation_block_start_new_entries():
+    linked = AuthorLinker().link_from_texts(
+        ["Author One1", "Author Two2", "Author Three3", "Author Four4"],
+        [
+            "Department of Radiology, Stanford University, Stanford, CA, USA, "
+            "Stroke Unit, Neurology, Hospital Vall d'Hebron, Barcelona, Spain, "
+            "Stanford, United States 2Stroke Unit, Neurology, Hospital Vall d'Hebron, "
+            "Barcelona, Spain 3Department of Neurology, Montpellier University Hospital, "
+            "Montpellier, France 4Department of Neurology, Stanford University, "
+            "Stanford, CA, USA"
+        ],
+    )
+
+    assert [affiliation.id for affiliation in linked.affiliations] == ["1", "2", "3", "4"]
+    assert linked.authors[0].affiliation_ids == ["1"]
+    assert linked.authors[1].affiliation_ids == ["2"]
+    assert linked.authors[2].affiliation_ids == ["3"]
+    assert linked.authors[3].affiliation_ids == ["4"]
+
+
+def test_affiliation_fields_keep_departments_and_extract_korean_location(tmp_path):
+    groups = _groups(
+        tmp_path,
+        _document(
+            [_author("Y.", "Kim", ["1"])],
+            [Affiliation(id="1", text="Division of Pediatric Endocrinology and Metabolism, Department of Pediatrics, Chungnam National University Sejong Hospital, Sejong, South Korea")],
+        ),
+    )
+    affiliation = groups[0].find(_q("affiliation"))
+
+    assert affiliation.find(_q("organization")).text == "Division of Pediatric Endocrinology and Metabolism, Department of Pediatrics, Chungnam National University Sejong Hospital"
+    assert affiliation.find(_q("city")).text == "Sejong"
+    assert affiliation.find(_q("country")).get("iso-code") == "KOR"

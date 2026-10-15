@@ -245,10 +245,35 @@ class JATSGenerator:
         return initials, " ".join(parts[surname_start:])
 
     def _split_affiliation(self, text: str) -> tuple[str, str, str]:
-        parts = [part.strip() for part in text.split(",") if part.strip()]
-        organization = parts[0] if parts else text
-        city = parts[1] if len(parts) > 1 else ""
-        country = parts[2] if len(parts) > 2 else ""
+        # Keep the institutional hierarchy together. Earlier code treated
+        # comma-separated departments as cities (e.g. "Department of
+        # Pediatrics"), producing structurally incorrect affiliation fields.
+        text = self._repair_mojibake(text)
+        parts = [self._sanitize_xml_text(part).strip() for part in text.split(",") if part.strip()]
+        if parts:
+            repeated_country = re.fullmatch(
+                r"(?P<country>UK|USA|United Kingdom|United States(?: of America)?)"
+                r"(?:\s+\1)+",
+                parts[-1],
+                flags=re.IGNORECASE,
+            )
+            if repeated_country:
+                parts[-1] = repeated_country.group("country")
+        country_names = {
+            "south korea", "republic of korea", "korea", "japan", "china",
+            "india", "singapore", "canada", "australia", "germany", "france",
+            "italy", "spain", "netherlands", "taiwan", "united states", "united states of america",
+            "usa", "uk", "united kingdom",
+        }
+        country_index = next(
+            (index for index in range(len(parts) - 1, -1, -1) if parts[index].casefold() in country_names),
+            None,
+        )
+        country = parts[country_index] if country_index is not None else ""
+        location_end = country_index if country_index is not None else len(parts)
+        city = parts[location_end - 1] if location_end > 1 else ""
+        organization_end = location_end - 1 if city else location_end
+        organization = ", ".join(parts[:organization_end]) if organization_end else (parts[0] if parts else text)
         return organization, city, country
 
     def _country_iso_code(self, country: str) -> str:
@@ -258,8 +283,36 @@ class JATSGenerator:
             "united states of america": "USA",
             "uk": "GBR",
             "united kingdom": "GBR",
+            "south korea": "KOR",
+            "republic of korea": "KOR",
+            "korea": "KOR",
+            "usa": "USA",
+            "china": "CHN",
+            "india": "IND",
+            "singapore": "SGP",
+            "canada": "CAN",
+            "australia": "AUS",
+            "germany": "DEU",
+            "france": "FRA",
+            "italy": "ITA",
+            "spain": "ESP",
+            "netherlands": "NLD",
+            "taiwan": "TWN",
         }
         return country_codes.get(country.casefold(), "UNK")
+
+    @staticmethod
+    def _repair_mojibake(value: str) -> str:
+        """Undo common UTF-8 bytes decoded as Latin-1 when it is reversible."""
+
+        text = str(value or "")
+        if not any(marker in text for marker in ("Ã", "Â", "â")):
+            return text
+        try:
+            repaired = text.encode("latin-1").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            return text
+        return repaired if repaired.count("�") <= text.count("�") else text
 
     def _metadata_value(self, document: Document, key: str, default: str = "") -> str:
         value = document.metadata.get(key, default)

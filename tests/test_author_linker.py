@@ -84,6 +84,29 @@ def test_letter_and_symbol_markers_are_matched():
     assert linked.authors[1].affiliation_ids == ["*"]
 
 
+def test_glued_letter_markers_are_removed_from_names_and_affiliation_labels():
+    linked = AuthorLinker().link_from_texts(
+        ["J. Abella", "R. Savagea", "A. Kirkhama", "O. Ansorgec", "G. Thompsone"],
+        [
+            "aUniversity of Birmingham, Birmingham, UK; "
+            "bQueen Elizabeth Hospital Birmingham; "
+            "cUniversity of Oxford, Oxford, UK; "
+            "dOxford University Hospitals NHS Trust, Oxford, UK; "
+            "eUniversity of Edinburgh, Edinburgh, UK"
+        ],
+    )
+
+    assert [affiliation.id for affiliation in linked.affiliations] == ["a", "b", "c", "d", "e"]
+    assert linked.authors[1].surname == "Savage"
+    assert linked.authors[1].affiliation_ids == ["a"]
+    assert linked.authors[2].surname == "Kirkham"
+    assert linked.authors[2].affiliation_ids == ["a"]
+    assert linked.authors[3].surname == "Ansorge"
+    assert linked.authors[3].affiliation_ids == ["c"]
+    assert linked.authors[4].surname == "Thompson"
+    assert linked.authors[4].affiliation_ids == ["e"]
+
+
 def test_marker_ranges_and_lists_are_expanded():
     linked = AuthorLinker().link_from_texts(
         ["Jane Doe1,3", "John Smith2"],
@@ -291,3 +314,86 @@ def test_printed_single_affiliation_is_still_shared_by_every_author():
     )
 
     assert [author.affiliation_ids for author in linked.authors] == [["aff_1"], ["aff_1"]]
+
+
+def test_llm_response_authors_and_affiliations_are_linked():
+    """The model's author and affiliation lists become JATS link data."""
+
+    linked = AuthorLinker().link_from_llm_response(
+        {
+            "authors": [
+                {
+                    "display_name": "Jane Doe",
+                    "given_names": "Jane",
+                    "surname": "Doe",
+                    "initials": "J.",
+                    "markers": ["1"],
+                    "affiliations": ["1"],
+                },
+                {
+                    "display_name": "John Smith",
+                    "surname": "Smith",
+                    "affiliations": ["2"],
+                    "corresponding": True,
+                },
+            ],
+            "affiliations": [
+                {"marker": "1", "text": "Alpha University, USA"},
+                {"marker": "2", "text": "Beta Institute, UK"},
+            ],
+        }
+    )
+
+    assert [author.display_name for author in linked.authors] == ["Jane Doe", "John Smith"]
+    assert [author.affiliation_ids for author in linked.authors] == [["1"], ["2"]]
+    assert linked.corresponding_author is linked.authors[1]
+    assert [affiliation.text for affiliation in linked.affiliations] == [
+        "Alpha University, USA",
+        "Beta Institute, UK",
+    ]
+
+
+def test_llm_markers_link_an_author_the_model_did_not_join():
+    """A listed marker still resolves even without an explicit link list."""
+
+    linked = AuthorLinker().link_from_llm_response(
+        {
+            "authors": [{"display_name": "Jane Doe", "markers": ["2"]}],
+            "affiliations": [
+                {"marker": "1", "text": "Alpha University"},
+                {"marker": "2", "text": "Beta University"},
+            ],
+        }
+    )
+
+    assert linked.authors[0].surname == "Doe"
+    assert linked.authors[0].affiliation_ids == ["2"]
+
+
+def test_llm_response_without_links_falls_back_to_the_car_rules():
+    """Naming affiliations but linking none must not leave authors orphaned."""
+
+    linked = AuthorLinker().link_from_llm_response(
+        {
+            "authors": [{"display_name": "Jane Doe"}],
+            "affiliations": [{"marker": "1", "text": "Alpha University"}],
+        }
+    )
+
+    assert linked.authors[0].affiliation_ids == ["1"]
+
+
+def test_llm_response_without_markers_does_not_assume_among_several():
+    """Two authors and two affiliations with no links stay unlinked."""
+
+    linked = AuthorLinker().link_from_llm_response(
+        {
+            "authors": [{"display_name": "Jane Doe"}, {"display_name": "John Smith"}],
+            "affiliations": [
+                {"marker": "1", "text": "Alpha University"},
+                {"marker": "2", "text": "Beta University"},
+            ],
+        }
+    )
+
+    assert [author.affiliation_ids for author in linked.authors] == [[], []]

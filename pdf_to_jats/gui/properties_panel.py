@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QFormLayout,
     QGroupBox,
     QLabel,
@@ -107,6 +108,8 @@ class PropertiesPanel(QWidget):
 class AuthorAffiliationReviewPanel(QWidget):
     """Dedicated review surface for extracted authors and affiliations."""
 
+    linksApplied = Signal(object)
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         layout = QVBoxLayout(self)
@@ -121,7 +124,20 @@ class AuthorAffiliationReviewPanel(QWidget):
         self.review_tree.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.review_tree.setUniformRowHeights(True)
         self.review_tree.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.link_table = QTableWidget(0, 0)
+        self.link_table.setAlternatingRowColors(True)
+        self.link_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.link_table.setWordWrap(False)
+        self.link_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.link_table.setToolTip("Check each author/affiliation relationship supported by the source.")
+        self.apply_links_btn = QPushButton("Apply Author Links")
+        self.apply_links_btn.setEnabled(False)
+        self.apply_links_btn.clicked.connect(self._emit_links)
         review_layout.addWidget(self.review_hint)
+        review_layout.addWidget(QLabel("Review links (check all affiliations for each author):"))
+        review_layout.addWidget(self.link_table, 1)
+        review_layout.addWidget(self.apply_links_btn)
+        review_layout.addWidget(QLabel("Link diagnostics:"))
         review_layout.addWidget(self.review_tree, 1)
         layout.addWidget(review_box, 1)
         self.setMinimumWidth(0)
@@ -136,10 +152,46 @@ class AuthorAffiliationReviewPanel(QWidget):
         """Populate the author-to-affiliation links and matching warnings."""
 
         self.review_tree.clear()
+        self.link_table.clear()
+        self.link_table.setRowCount(0)
+        self.link_table.setColumnCount(0)
         if not enabled:
             self.review_hint.setText("Load a PDF to review author/affiliation links.")
+            self.apply_links_btn.setEnabled(False)
             return
         authors, affiliations, issues = list(authors or []), list(affiliations or []), list(issues or [])
+        self.link_table.setRowCount(len(authors))
+        self.link_table.setColumnCount(1 + len(affiliations))
+        headers = [QTableWidgetItem("Author")]
+        for affiliation in affiliations:
+            marker = str(getattr(affiliation, "marker", "") or "")
+            label = f"[{marker or affiliation.id}] {str(getattr(affiliation, 'text', '') or '')[:36]}"
+            header = QTableWidgetItem(label)
+            header.setData(Qt.UserRole, affiliation.id)
+            header.setToolTip(str(getattr(affiliation, "text", "") or ""))
+            headers.append(header)
+        self.link_table.setHorizontalHeaderLabels([header.text() for header in headers])
+        for column, header in enumerate(headers):
+            self.link_table.setHorizontalHeaderItem(column, header)
+        for row_index, author in enumerate(authors):
+            author_item = QTableWidgetItem(self._author_label(author))
+            author_item.setFlags(author_item.flags() & ~Qt.ItemIsEditable)
+            author_item.setData(Qt.UserRole, getattr(author, "id", ""))
+            self.link_table.setItem(row_index, 0, author_item)
+            linked_ids = set(getattr(author, "affiliation_ids", []) or [])
+            for column, affiliation in enumerate(affiliations, start=1):
+                item = QTableWidgetItem("")
+                item.setFlags(
+                    (item.flags() | Qt.ItemIsUserCheckable) & ~Qt.ItemIsEditable
+                )
+                item.setCheckState(
+                    Qt.Checked if affiliation.id in linked_ids else Qt.Unchecked
+                )
+                item.setToolTip(str(getattr(affiliation, "text", "") or ""))
+                self.link_table.setItem(row_index, column, item)
+        self.link_table.setColumnWidth(0, 180)
+        self.link_table.resizeColumnsToContents()
+        self.apply_links_btn.setEnabled(bool(authors and affiliations))
         severity_by_affiliation: dict[str, str] = {}
         severity_by_author: dict[str, str] = {}
         for issue in issues:
@@ -199,6 +251,24 @@ class AuthorAffiliationReviewPanel(QWidget):
         else:
             self.review_hint.setText(f"{len(authors)} author(s), {len(affiliations)} affiliation(s), all links resolved.")
 
+    def _emit_links(self) -> None:
+        """Send the checked author-to-affiliation map to the owning window."""
+
+        mapping = []
+        for row in range(self.link_table.rowCount()):
+            author_item = self.link_table.item(row, 0)
+            if author_item is None:
+                continue
+            author_id = str(author_item.data(Qt.UserRole) or "")
+            affiliation_ids = []
+            for column in range(1, self.link_table.columnCount()):
+                item = self.link_table.item(row, column)
+                if item is not None and item.checkState() == Qt.Checked:
+                    header = self.link_table.horizontalHeaderItem(column)
+                    affiliation_ids.append(str(header.data(Qt.UserRole) or "") if header else "")
+            mapping.append({"author_id": author_id, "affiliation_ids": [item for item in affiliation_ids if item]})
+        self.linksApplied.emit(mapping)
+
     @staticmethod
     def _author_label(author) -> str:
         name = str(getattr(author, "display_name", "") or "").strip() or "(unnamed author)"
@@ -225,10 +295,13 @@ class MetadataPanel(QWidget):
         self.abstract_number_editor.setPlaceholderText("e.g. 4349")
         self.abstract_number_editor.setClearButtonEnabled(True)
         self.abstract_number_editor.textChanged.connect(self._on_abstract_number_text_changed)
-        self.apply_abstract_number_btn = QPushButton("Apply Abstract No")
+        self.apply_abstract_number_btn = QPushButton("Start Article With This Number")
         self.apply_abstract_number_btn.setEnabled(False)
+        self.article_hint = QLabel()
+        self.article_hint.setWordWrap(True)
         article_form.addRow("Abstract No", self.abstract_number_editor)
         article_form.addRow("", self.apply_abstract_number_btn)
+        article_form.addRow(self.article_hint)
         layout.addWidget(self.article_box)
         self._abstract_number_value = ""
         self._abstract_number_editable = False
@@ -284,8 +357,13 @@ class MetadataPanel(QWidget):
         outer.addWidget(scroll)
         self.setMinimumWidth(0)
 
-    def set_abstract_number(self, abstract_number: str, enabled: bool = True) -> None:
-        """Show the article's abstract number so it can be reviewed and edited."""
+    def set_abstract_number(self, abstract_number: str, enabled: bool = True, hint: str | None = None) -> None:
+        """Show the article's abstract number so it can be reviewed and edited.
+
+        In the new startup flow the Abstract No field is the first required action:
+        it is enabled right after a PDF loads, and the hint above the button tells the
+        user what the next action is.
+        """
 
         value = str(abstract_number or "").strip()
         if value.upper() == "ABSN":
@@ -297,6 +375,7 @@ class MetadataPanel(QWidget):
         self.abstract_number_editor.blockSignals(False)
         self.abstract_number_editor.setEnabled(enabled)
         self.apply_abstract_number_btn.setEnabled(False)
+        self.article_hint.setText(hint or "")
 
     def _on_abstract_number_text_changed(self, text: str) -> None:
         """Enable applying only when the reviewed value actually changed."""

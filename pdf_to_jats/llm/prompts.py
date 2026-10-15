@@ -14,6 +14,8 @@ QUESTION_ANSWER_PROMPT = (
     "  Return the bare identifier only, without labels such as \"Abstract No\".\n"
     "- What text does not belong to these metadata fields?\n"
     "\n"
+    "When a block's text is a paragraph continuation (only part of a sentence or\n"
+    "clause), use its paragraph_text field for full context.\n"
     "Return JSON only in this form:\n"
     "{\n"
     '  "title": {"block_ids": ["block_001"], "text": "..."},\n'
@@ -80,6 +82,8 @@ ROLE_ASSIGNMENT_PROMPT = (
     "Rules:\n"
     "- Use only the provided block text, layout context, and answer summary.\n"
     "- structural_evidence is advisory Docling structure, not a replacement for block text or precise layout fields.\n"
+    "- When a block's text is only a fragment of a longer paragraph (a continuation line),\n"
+    "  use paragraph_text — the full reconstructed paragraph — for role context.\n"
     "- Prefer title for the single best title block, not subtitles or section headers.\n"
     "- Prefer author for person names or author lists. There may be multiple author blocks, and author order matters.\n"
     "- Prefer affiliation for institutional text or affiliation lists. There may be multiple affiliation blocks, and affiliation order matters.\n"
@@ -94,6 +98,65 @@ ROLE_ASSIGNMENT_PROMPT = (
     '  "assignments": [\n'
     '    {"block_id": "block_001", "role": "title", "confidence": 0.98},\n'
     '    {"block_id": "block_002", "role": "author", "confidence": 0.91}\n'
+    "  ]\n"
+    "}\n"
+    "Do not include explanations."
+)
+
+AUTHOR_AFFILIATION_PROMPT = (
+    "You are a careful parser that extracts and links authors and affiliations from\n"
+    "scientific articles. Use the source text and layout as evidence; support different\n"
+    "journal styles rather than assuming one fixed format.\n"
+    "You receive the title and the raw author and affiliation lines of ONE article.\n"
+    "Parse every author and every affiliation, normalize their names, and link\n"
+    "each author to the affiliations that belong to that author. Return one JSON\n"
+    "object per author and one per affiliation, even for very long lists.\n"
+    "\n"
+    "Rules:\n"
+    "- Read all author and affiliation blocks before linking. Use reading order,\n"
+    "  adjacency, line breaks, and printed markers together as evidence.\n"
+    "- Preserve the authors in the order they are printed. Separate each name from\n"
+    "  adjacent affiliation markers. Hyphens may join given-name initials or parts\n"
+    "  of a name; do not treat a final token such as J-Y or C-S as a surname solely\n"
+    "  because it is last. If name order is unclear, preserve the display name and\n"
+    "  avoid inventing a given-name/surname split.\n"
+    "- Return every author and affiliation as a separate array item. Do not\n"
+    "  summarize, group, abbreviate, or stop early because the list is long.\n"
+    "- Preserve affiliation order and include the complete department, institution,\n"
+    "  city, and country text for each affiliation.\n"
+    "- Author names and affiliations may share one line. First identify the author\n"
+    "  names, then identify affiliation entries by their printed markers.\n"
+    "- Normalize superscript and baseline digits as the same marker. Markers may be\n"
+    "  (¹ means \"1\", ² means \"2\", and so on).\n"
+    "- Lowercase letter markers (a, b, c, ...) may be glued to names or\n"
+    "  affiliation names. Remove them from the name/institution text and use\n"
+    "  them only as marker references.\n"
+    "- A new marked affiliation can begin after a comma or whitespace, including\n"
+    "  when its marker is glued to the first word. Split there; do not merge it with the\n"
+    "  preceding affiliation. Do not split affiliation text at ordinary commas.\n"
+    "- Give each affiliation its printed marker and text without the leading marker.\n"
+    "- Link each author to every affiliation supported by matching printed markers.\n"
+    "  Several authors may share an affiliation, and one author may have several.\n"
+    "  With exactly one affiliation and no conflicting evidence, link all authors to it.\n"
+    "  With several affiliations, do not assign by author order alone; leave uncertain\n"
+    "  links empty instead of guessing.\n"
+    "- Before returning, check that the final visible author and affiliation\n"
+    "  entries from the input are represented in the arrays.\n"
+    "- Do not invent authors or affiliations that are not present in the provided lines.\n"
+    "- Mark the presenting/corresponding author when the source says so.\n"
+    "- If the article prints no affiliations, return an empty affiliations list.\n"
+    "\n"
+    "Return JSON only in this form:\n"
+    "{\n"
+    '  "authors": [\n'
+    '    {"display_name": "Jane Doe", "given_names": "Jane", "surname": "Doe", '
+    '"initials": "J.", "markers": ["1"], "affiliations": ["1"], "corresponding": false},\n'
+    '    {"display_name": "John Smith", "given_names": "John", "surname": "Smith", '
+    '"initials": "J.", "markers": ["2"], "affiliations": ["2"], "corresponding": false}\n'
+    "  ],\n"
+    '  "affiliations": [\n'
+    '    {"marker": "1", "text": "Department of Medicine, North University, Boston, USA"},\n'
+    '    {"marker": "2", "text": "City Hospital, Chicago, USA"}\n'
     "  ]\n"
     "}\n"
     "Do not include explanations."
