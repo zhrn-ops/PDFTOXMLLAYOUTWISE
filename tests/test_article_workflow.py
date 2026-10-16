@@ -844,6 +844,51 @@ def test_finishing_a_selection_exports_only_its_blocks(tmp_path):
     assert window._finished_segment_keys == ["block_004"]
 
 
+def test_selection_export_document_uses_only_selected_block_ids():
+    """An export-without-number scopes XML to the selected article blocks."""
+
+    document = _stacked_page_document()
+    window = _window(document)
+    window.linker = AuthorLinker()
+    segment = {
+        "abstract_number": "ABSN",
+        "start_page": 1,
+        "end_page": 1,
+        "block_ids": ["block_004", "block_005"],
+    }
+
+    exported = window._document_for_segment(segment)
+
+    assert [block.id for block in exported.blocks] == ["block_004", "block_005"]
+    assert exported.metadata["abstract_number"] == "ABSN"
+
+
+def test_article_export_keeps_a_merged_block_owned_by_its_merged_id():
+    """Role assignment after a merge remains visible to that article's XML."""
+
+    document = _stacked_page_document()
+    merged = _block(
+        "FIRST ARTICLE TITLE Jane Doe",
+        block_id="merged_001_149",
+        metadata={"reading_order": 1, "merged_block_ids": ["block_001", "block_002"]},
+    )
+    merged.role = "title"
+    document.blocks = [merged, *document.blocks[2:]]
+    window = _window(document)
+    window.linker = AuthorLinker()
+    segment = {
+        "abstract_number": "5583",
+        "start_page": 1,
+        "end_page": 1,
+        "block_ids": ["merged_001_149"],
+    }
+
+    exported = window._document_for_segment(segment)
+
+    assert [block.id for block in exported.blocks] == ["merged_001_149"]
+    assert {block.id for block in exported.raw_blocks} == {"block_001", "block_002"}
+
+
 def test_exported_paragraph_drops_lines_outside_the_article(tmp_path):
     """A paragraph reconstructed across the PDF must be trimmed to the article.
 
@@ -967,6 +1012,23 @@ def test_detected_articles_need_confirmation_before_export():
 
     assert len(segments) == 2
     assert window._exportable_segments(segments) == []
+
+
+def test_explicit_number_workflow_exports_only_finished_articles():
+    """Started articles stay out of a later batch export until they are finished."""
+
+    document = _stacked_page_document()
+    segment = _segment(index=1, abstract_number="P-605", start_page=1, end_page=1)
+    segment["article_key"] = "block_001"
+    document.metadata["article_segments"] = [segment]
+    window = _window(document)
+    window._startup_flow = True
+    window._explicit_number_workflow = True
+
+    assert window._exportable_segments([segment]) == []
+
+    window._finished_segment_keys = ["block_001"]
+    assert window._exportable_segments([segment]) == [segment]
 
 
 def test_finishing_a_detected_article_confirms_it_for_export():

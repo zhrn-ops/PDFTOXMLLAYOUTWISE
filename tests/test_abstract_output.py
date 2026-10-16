@@ -63,3 +63,36 @@ def test_abstract_number_is_written_as_the_absn_itemid(tmp_path):
     }
 
     assert itemids["ABSN"] == "S100"
+
+
+def test_soft_hyphenated_absn_is_removed_from_titletext(tmp_path):
+    root = _root(
+        Document(
+            title="EPO-\u00ad0818 | Thalamic subnuclei atrophy",
+            metadata={"abstract_number": "EPO-0818"},
+        ),
+        tmp_path,
+    )
+
+    title = root.find(f".//{{{ANI_NS}}}titletext")
+    itemid = root.find(f".//{{{ANI_NS}}}itemid[@idtype='ABSN']")
+
+    assert title is not None
+    assert title.text == "Thalamic subnuclei atrophy"
+    assert itemid is not None
+    assert itemid.text == "EPO-0818"
+
+
+def test_missing_absn_keeps_title_but_removes_an_explicit_label(tmp_path):
+    root = _root(
+        Document(title="Abstract No: Thalamic subnuclei atrophy"),
+        tmp_path,
+    )
+
+    title = root.find(f".//{{{ANI_NS}}}titletext")
+    itemid = root.find(f".//{{{ANI_NS}}}itemid[@idtype='ABSN']")
+
+    assert title is not None
+    assert title.text == "Thalamic subnuclei atrophy"
+    assert itemid is not None
+    assert itemid.text == "ABSN"

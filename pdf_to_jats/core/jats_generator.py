@@ -341,9 +341,26 @@ class JATSGenerator:
         text = re.sub(r"\s+", " ", self._sanitize_xml_text(value)).strip()
         if not text:
             return ""
-        if abstract_number and abstract_number.upper() != "ABSN":
+        # With no supplied identifier, retain the title verbatim.  Only a
+        # clearly editorial label can be discarded safely; guessing a number
+        # from ordinary title text risks deleting real content.
+        if not abstract_number or abstract_number.upper() == "ABSN":
             text = re.sub(
-                rf"^\s*[\(\[]?{re.escape(abstract_number)}[\)\]]?\s*(?:\||\u2502|[:.\-\u2013\u2014])?\s+",
+                r"^\s*(?:abstract\s*(?:no\.?|number|nr\.?|id)?|absn)\s*[:#|]\s*",
+                "",
+                text,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+        if abstract_number and abstract_number.upper() != "ABSN":
+            # A soft/discretionary hyphen can be embedded beside the visible
+            # dash in extracted PDF text, e.g. ``EPO-\u00ad0818``.  It remains
+            # the same ABSN identifier and must not survive in titletext.
+            number_pattern = re.escape(abstract_number).replace(
+                r"\-", r"[-\u00ad\u2010-\u2015]+"
+            )
+            text = re.sub(
+                rf"^\s*[\(\[]?{number_pattern}[\)\]]?\s*(?:\||\u2502|[:.\-\u2013\u2014])?\s+",
                 "",
                 text,
                 count=1,

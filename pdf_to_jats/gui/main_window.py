@@ -115,6 +115,10 @@ class MainWindow(QMainWindow):
         self._finished_segment_keys: list[str] = []
         self._deleted_segment_keys: list[str] = []
         self._current_segment_key: str | None = None
+        # Set only by the normal PDF load path.  Keeping it separate from
+        # ``_startup_flow`` lets older documents and headless workflow tests
+        # retain their legacy detector-segment behavior.
+        self._explicit_number_workflow = False
         # The normal PDF workflow is deliberately serial: completing one
         # article leaves no article active until the operator supplies the next
         # abstract number.  Tests and older saved segment data retain their
@@ -619,13 +623,64 @@ class MainWindow(QMainWindow):
         if self.document is None:
             QMessageBox.information(self, "No document", "Load a PDF first.")
             return
-        if not self._article_starts():
-            QMessageBox.information(
-                self,
-                "No article started yet",
-                "Enter an article/abstract number in Article Metadata and select "
-                "Start Article With This Number before exporting XML.",
+        finished_segment = self._selected_finished_article()
+        if finished_segment is not None:
+            # A finished article has no active working segment, but Generate
+            # XML should still be able to write its already-reviewed XML again.
+            self._update_document_model()
+            export_document = self._document_with_html_preview_continuations()
+            segment_document = self._document_for_segment(finished_segment, export_document)
+            output_dir = self._choose_output_directory(
+                "Choose XML output folder", self.config.generated_xml_dir
             )
+            if output_dir is None:
+                return
+            filename = self._article_filename(segment_document, 1, 1)
+            generated_path = self.generator.generate(segment_document, output_dir / filename)
+            self.current_xml_path = generated_path
+            errors = self.validator.validate(generated_path)
+            for error in errors:
+                self._log(f"Validation error in {generated_path.name}: {error.message}")
+            if not errors:
+                self._log(f"XML written to {generated_path}")
+            return
+        if not self._article_starts():
+            selected = self._selected_contiguous_run()
+            if selected is None:
+                QMessageBox.information(
+                    self,
+                    "Select an article first",
+                    "Select the contiguous blocks that make up the article before exporting XML.",
+                )
+                return
+            QMessageBox.warning(
+                self,
+                "No abstract number",
+                "No abstract number has been entered. The selected blocks will be "
+                "exported as one XML file with ABSN as the identifier.",
+                QMessageBox.Ok,
+            )
+            self._update_document_model()
+            export_document = self._document_with_html_preview_continuations()
+            segment = {
+                "abstract_number": "ABSN",
+                "start_page": min(block.page for block in selected),
+                "end_page": max(block.page for block in selected),
+                "block_ids": [block.id for block in selected],
+            }
+            segment_document = self._document_for_segment(segment, export_document)
+            output_dir = self._choose_output_directory(
+                "Choose XML output folder", self.config.generated_xml_dir
+            )
+            if output_dir is None:
+                return
+            generated_path = self.generator.generate(segment_document, output_dir / "article.xml")
+            self.current_xml_path = generated_path
+            errors = self.validator.validate(generated_path)
+            for error in errors:
+                self._log(f"Validation error in {generated_path.name}: {error.message}")
+            if not errors:
+                self._log(f"XML written to {generated_path}")
             return
         selected_blocks = [block for block in self.document.blocks if block.id in self._selected_block_ids]
         if len(selected_blocks) >= 2:
@@ -1035,6 +1090,24 @@ class MainWindow(QMainWindow):
         segments = self.document.metadata.get("article_segments", [])
         return [segment for segment in segments if isinstance(segment, dict)]
 
+    def _uses_explicit_article_flow(self) -> bool:
+        """Whether the document contains articles made from manual numbers.
+
+        A loaded PDF begins in the explicit-number flow with no segments.  Test
+        fixtures and older saved work can, however, already contain legacy
+        detector segments.  Those must retain their range-based identities and
+        finish behavior until a manually created article (``article_key``) is
+        present.
+        """
+
+        if not (
+            getattr(self, "_startup_flow", False)
+            and getattr(self, "_explicit_number_workflow", False)
+        ):
+            return False
+        segments = self._document_segments()
+        return not segments or any(str(segment.get("article_key") or "") for segment in segments)
+
     def _visible_segments(self) -> list[dict[str, object]]:
         """Segments the Detected Articles panel shows; deleted ones are hidden."""
 
@@ -1080,6 +1153,13 @@ class MainWindow(QMainWindow):
         segments = self._document_segments()
         if self.document is None or not segments:
             return [None] * len(segments)
+        if self._uses_explicit_article_flow():
+            return [
+                str(segment.get("article_key") or "")
+                or str(segment.get("title_block_id") or "")
+                or next(iter(self._segment_member_ids(segment)), None)
+                for segment in segments
+            ]
         stored = self.document.metadata.get("article_segments")
         cached = self._segment_identity_cache
         if cached is not None and cached[0] is self.document.blocks and cached[1] is stored:
@@ -1125,7 +1205,7 @@ class MainWindow(QMainWindow):
                 if key == self._current_segment_key:
                     return segment, key
             return None
-        if getattr(self, "_startup_flow", False):
+        if self._uses_explicit_article_flow():
             return None
         # Fall back to the first segment that is neither finished nor deleted,
         # so working state lands on an article an export would still produce.
@@ -1236,6 +1316,15 @@ class MainWindow(QMainWindow):
         self._update_html_preview()
         self._update_selection_panel()
         self._refresh_article_buttons()
+        # Finishing changes metadata in place.  Refresh the inspector for the
+        # still-selected block as well, otherwise it can display its old
+        # ``Locked: no`` value while edit actions correctly refuse the block.
+        selected = [
+            block for block in self._sort_reading_order(self.document.blocks)
+            if block.id in self._selected_block_ids
+        ]
+        if selected:
+            self._select_block_by_id(selected[0].id, preserve_selection=True)
 
     def _article_segmentation(self, ordered=None) -> Segmentation | None:
         """Return the current articles as boundaries over the reading stream.
@@ -1247,6 +1336,12 @@ class MainWindow(QMainWindow):
 
         if self.document is None:
             return None
+        if self._uses_explicit_article_flow():
+            return Segmentation.from_legacy_segments(
+                list(ordered) if ordered is not None else self._ensure_reading_orders(),
+                self._document_segments(),
+                number=self._normalize_abstract_number(self.document.abstract_number()),
+            )
         stream = list(ordered) if ordered is not None else self._ensure_reading_orders()
         return Segmentation.from_legacy_segments(
             stream,
@@ -1299,6 +1394,17 @@ class MainWindow(QMainWindow):
 
         if not key:
             return None
+        if self._uses_explicit_article_flow():
+            return next(
+                (
+                    segment
+                    for segment in self._document_segments()
+                    if str(segment.get("article_key") or "") == key
+                    or str(segment.get("title_block_id") or "") == key
+                    or key in self._segment_member_ids(segment)
+                ),
+                None,
+            )
         for segment, segment_key in self._segments_with_keys():
             if segment_key == key:
                 return segment
@@ -1986,6 +2092,17 @@ class MainWindow(QMainWindow):
         exports as a whole. Deleted articles never export.
         """
 
+        if self._uses_explicit_article_flow():
+            # In the manual-number workflow, Finish Article is the hand-off:
+            # it validates and writes one XML, then records the finished key.
+            # A later bulk export must therefore not include a work-in-progress
+            # article merely because it has already been started.
+            return [
+                segment
+                for segment in segments
+                if not self._is_segment_deleted(segment)
+                and self._segment_key(segment) in self._finished_segment_keys
+            ]
         if len(segments) <= 1:
             return [segment for segment in segments if not self._is_segment_deleted(segment)]
         return [
@@ -2365,6 +2482,9 @@ class MainWindow(QMainWindow):
     def _refresh_articles_list(self) -> None:
         """Show one tab per detected article so false splits can be merged."""
 
+        if self._uses_explicit_article_flow() and self.document is not None:
+            # Only segments explicitly started by the user appear in this list.
+            self.document.metadata.pop(self.DETECTED_SEGMENTS_KEY, None)
         segments = self._visible_segments() if self.document is not None else []
         previous_key = self._current_segment_key
         self.articles_tabs.blockSignals(True)
@@ -2726,6 +2846,28 @@ class MainWindow(QMainWindow):
 
         if self.document is None:
             return []
+        if self._uses_explicit_article_flow():
+            member_ids = set(self._segment_member_ids(segment))
+            if not member_ids:
+                return []
+            source_by_id = {
+                block.id: block
+                for block in [*(self.document.raw_blocks or []), *self.document.blocks]
+            }
+            display_by_source_id = {}
+            for block in self.document.blocks:
+                source_ids = (block.metadata or {}).get("merged_block_ids", []) or [block.id]
+                for source_id in source_ids:
+                    display_by_source_id.setdefault(str(source_id), block)
+            visible = []
+            seen_ids = set()
+            for member_id in member_ids:
+                source_block = source_by_id.get(member_id)
+                display_block = display_by_source_id.get(member_id, source_block)
+                if display_block is not None and display_block.id not in seen_ids:
+                    visible.append(display_block)
+                    seen_ids.add(display_block.id)
+            return sorted(visible, key=reading_order_key)
         return sorted(
             (block for block in self.document.blocks if block_matches_segment(block, segment)),
             key=reading_order_key,
@@ -3084,6 +3226,7 @@ class MainWindow(QMainWindow):
             return False
         self._push_article_undo("rename article")
         self._set_abstract_number(number, target)
+        self.document.metadata.pop(self.DETECTED_SEGMENTS_KEY, None)
         self._refresh_article_buttons()
         self._notify(f"Article {target.get('index', '?')} is now ABSN {number}.")
         return True
@@ -3190,10 +3333,26 @@ class MainWindow(QMainWindow):
             block.id: block
             for block in [*(source.raw_blocks or []), *source.blocks]
         }
+        member_ids = {str(block_id) for block_id in segment.get("block_ids", [])}
+        # An article is attached to the editable display block.  A manual merge
+        # replaces that block with (for example) ``merged_001_149``, while its
+        # XML paragraphs still refer to the original source-line IDs.  Expand
+        # the membership to those source IDs so both views stay in the export.
+        member_source_ids = set(member_ids)
+        if member_ids:
+            for display_block in source.blocks:
+                if display_block.id in member_ids:
+                    member_source_ids.update(
+                        str(source_id)
+                        for source_id in (display_block.metadata or {}).get("merged_block_ids", [])
+                    )
 
         def belongs_to_segment(block) -> bool:
             """Include a merged block when any of its source lines belongs here."""
 
+            if member_ids:
+                source_ids = [block.id, *(block.metadata or {}).get("merged_block_ids", [])]
+                return any(str(source_id) in member_source_ids for source_id in source_ids)
             if block_matches_segment(block, segment):
                 return True
             return any(
@@ -3307,16 +3466,14 @@ class MainWindow(QMainWindow):
         No in Article Metadata. Until then every export/finish/pipeline action must be
         refused with a clear pointer at the metadata field.
 
-        The existing per-article tests build document metadata directly, without the
-        real load path. In that case a document still has article segments even though
-        no Abstract No field has been used to create an article, so this helper reports
-        True whenever article segments exist. That keeps the existing finish/split/merge
-        tests passing while the new application-level flow still gates on the metadata
-        field when a PDF is loaded the normal way.
+        A started article is represented by a segment even before any content
+        blocks have been explicitly selected.
         """
 
         if self.document is None:
             return False
+        if self._uses_explicit_article_flow():
+            return self._current_segment() is not None
         if self._current_segment() is not None:
             return True
         return bool(self._document_segments())
@@ -3364,21 +3521,18 @@ class MainWindow(QMainWindow):
                 return False
             first_block_id = selected[0].id
         else:
-            first_block_id = self._first_unclaimed_block_id()
-            # Once an article has been completed, its legacy range may cover
-            # the rest of the PDF until the next boundary is chosen.  Never
-            # reuse its first block as an implicit start for a new article.
-            if first_block_id is None:
-                if self._document_segments():
-                    return False
-                first_block_id = ordered[0].id
+            # Number entry creates an empty article shell only. No block is
+            # treated as owned until the user explicitly selects and assigns it.
+            selected = []
+            first_block_id = f"article_{len(self._document_segments()) + 1}"
 
-        member_ids = [block.id for block in selected] if self._selected_block_ids else [first_block_id]
+        member_ids = [block.id for block in selected]
         if any(self._article_owning(block_id) is not None for block_id in member_ids):
             return False
         self._push_article_undo("start article from number")
         segment: dict[str, object] = {
             "index": len(self._document_segments()) + 1,
+            "article_key": first_block_id,
             "abstract_number": abstract_number,
             "abstract_number_block_id": "",
             "columns": None,
@@ -3386,9 +3540,14 @@ class MainWindow(QMainWindow):
             "block_ids": member_ids,
             "deleted": False,
         }
+        title = next((block for block in selected if block.role == "title"), None)
+        if title is not None:
+            segment["title_block_id"] = title.id
         self._sync_membership_segment(segment)
         self._replace_article_segments([*self._document_segments(), segment])
         self._current_segment_key = first_block_id
+        self.document.metadata["abstract_number"] = abstract_number
+        self.document.metadata.pop(self.DETECTED_SEGMENTS_KEY, None)
         self._refresh_selected_blocks_view()
         return True
 
@@ -3570,6 +3729,20 @@ class MainWindow(QMainWindow):
                 return segment
         return None
 
+    def _selected_finished_article(self) -> dict | None:
+        """Return the one finished article represented by the selection."""
+
+        if self.document is None or not self._selected_block_ids:
+            return None
+        matches: list[dict] = []
+        for block_id in self._selected_block_ids:
+            segment = self._article_owning(block_id)
+            if segment is None or self._segment_key(segment) not in self._finished_segment_keys:
+                continue
+            if all(candidate is not segment for candidate in matches):
+                matches.append(segment)
+        return matches[0] if len(matches) == 1 else None
+
     def _article_for_title(self, title_id: str) -> dict | None:
         """The article a classified title owns, if one exists."""
 
@@ -3615,6 +3788,10 @@ class MainWindow(QMainWindow):
             columns = common_column(blocks)
             segment["columns"] = list(columns) if columns else None
         title_block = by_id.get(str(segment.get("title_block_id") or ""))
+        if title_block is None:
+            title_block = next((block for block in blocks if block.role == "title"), None)
+            if title_block is not None:
+                segment["title_block_id"] = title_block.id
         if title_block is not None:
             number, marker = self._inherit_article_number(title_block)
             if number and not str(segment.get("abstract_number") or "").strip():
@@ -3632,6 +3809,8 @@ class MainWindow(QMainWindow):
 
         if self.document is None:
             return None
+        if self._uses_explicit_article_flow():
+            return self._article_owning(title_id)
         existing = self._article_for_title(title_id)
         if existing is not None:
             self._sync_membership_segment(existing)
@@ -3682,12 +3861,19 @@ class MainWindow(QMainWindow):
         being worked on. Returns the number attached and the refused blocks.
         """
 
-        if self.document is None or not self._title_driven():
+        if self.document is None or not (
+            self._title_driven() or self._uses_explicit_article_flow()
+        ):
             return 0, []
         current = self._current_segment()
         if current is None:
             return 0, list(blocks)
         active = current[0]
+        anchor_ids = {
+            str(block_id)
+            for block_id in [active.get("title_block_id"), *self._segment_member_ids(active)]
+            if block_id
+        }
         members = list(self._segment_member_ids(active))
         attached = 0
         refused = []
@@ -3696,12 +3882,31 @@ class MainWindow(QMainWindow):
             if owner is not None and owner is not active:
                 refused.append(block)
                 continue
+            if block.role == "title" and block.id not in anchor_ids:
+                # An additional title may indicate the next article. Keep it
+                # outside this explicitly numbered segment until the user
+                # starts that article with its own number.
+                continue
             if block.id in members:
                 continue
             members.append(block.id)
             attached += 1
         if attached:
             active["block_ids"] = members
+            if not active.get("title_block_id"):
+                active["title_block_id"] = next(
+                    (block_id for block_id in members if block_id in anchor_ids), None
+                )
+            title_block = next(
+                (block for block in blocks if block.id in members and block.role == "title"),
+                None,
+            )
+            if title_block is not None:
+                active["title_block_id"] = title_block.id
+                current_key = str(active.get("article_key") or "")
+                if current_key.startswith("article_"):
+                    active["article_key"] = title_block.id
+                    self._current_segment_key = title_block.id
             self._sync_membership_segment(active)
             self._replace_article_segments(self._document_segments())
         return attached, refused
@@ -3718,6 +3923,31 @@ class MainWindow(QMainWindow):
 
         if self.document is None or not changed_blocks:
             return 0, []
+        if self._uses_explicit_article_flow():
+            active = self._current_segment()
+            if active is None:
+                return 0, list(changed_blocks)
+            segment = active[0]
+            title_blocks = [block for block in changed_blocks if block.role == "title"]
+            if title_blocks:
+                title = title_blocks[0]
+                existing = self._article_owning(title.id)
+                if existing is not None and existing is not segment:
+                    return 0, title_blocks
+                members = self._segment_member_ids(segment)
+                if title.id not in members:
+                    members.append(title.id)
+                segment["block_ids"] = members
+                segment["title_block_id"] = title.id
+                if str(segment.get("article_key", "")).startswith("article_"):
+                    segment["article_key"] = title.id
+                    self._current_segment_key = title.id
+                self._sync_membership_segment(segment)
+                self._replace_article_segments(self._document_segments())
+            non_title_blocks = [block for block in changed_blocks if block.role != "title"]
+            if non_title_blocks:
+                self._attach_blocks_to_active_article(non_title_blocks)
+            return len(changed_blocks), []
         for block in changed_blocks:
             if block.role == "title":
                 self._create_article_at_title(block.id)
@@ -4199,6 +4429,11 @@ class MainWindow(QMainWindow):
                 "unclassified",
             }:
                 continue
+            # Abstract numbers are entered explicitly in Article Metadata.
+            # Ignore the role model's guess so it cannot overwrite the number
+            # the operator has just assigned to this article.
+            if role == "abstract_number":
+                continue
             if role != "title" and scope is not None and block.id not in scope:
                 skipped_outside += 1
                 continue
@@ -4210,10 +4445,6 @@ class MainWindow(QMainWindow):
             block.confidence = confidence
             if previous_role == "title" and role != "title":
                 self._clear_manual_title_metadata_if_needed(block.id)
-            if role == "abstract_number":
-                # Only a person can untag a marker: if this model turns out to
-                # be wrong, the exclusion stays until the user says otherwise.
-                self._apply_abstract_number_role(block)
             changed.append((block.id, role))
             if block.id in selected_zone_block_ids:
                 for zone in (zone for zone in self.document.zones if zone.id in self._selected_zone_ids):
@@ -4336,65 +4567,9 @@ class MainWindow(QMainWindow):
         return []
 
     def _adopt_abstract_number(self, answer_summary: object, source_blocks: list | None = None) -> None:
-        """Adopt an abstract number the model separated out of the title.
+        """Ignore model-extracted numbers; Article Metadata is user controlled."""
 
-        The value replaces the regex-detected number so it is exported as the
-        ``ABSN`` itemid and stripped from the article title.
-        """
-
-        if self.document is None or not isinstance(answer_summary, dict):
-            return
-        entry = answer_summary.get("abstract_number")
-        if isinstance(entry, str):
-            raw_value, raw_ids = entry, []
-        elif isinstance(entry, dict):
-            raw_value, raw_ids = entry.get("text", ""), entry.get("block_ids", [])
-        else:
-            return
-        abstract_number = self._normalize_abstract_number(raw_value)
-        if not abstract_number:
-            return
-        blocks = source_blocks if source_blocks is not None else self.document.blocks
-        haystack = " ".join(str(block.text) for block in blocks)
-        if not re.search(re.escape(abstract_number), haystack, flags=re.IGNORECASE):
-            self._log(
-                f"Ignored model abstract number {abstract_number}: not present in the selected text."
-            )
-            return
-        candidate_ids = [str(block_id) for block_id in raw_ids] if isinstance(raw_ids, list) else []
-        blocks_by_id = {block.id: block for block in self.document.blocks}
-        # Only exclude blocks that hold nothing but the marker; a title block that
-        # merely starts with the number must survive and be trimmed instead.
-        marker_ids = [
-            block_id
-            for block_id in candidate_ids
-            if block_id in blocks_by_id
-            and self._is_abstract_number_marker(blocks_by_id[block_id].text, abstract_number)
-        ]
-        if marker_ids:
-            self.document.metadata["abstract_number_block_ids"] = marker_ids
-            for marker_id in marker_ids:
-                marker_block = blocks_by_id.get(marker_id)
-                if marker_block is not None and marker_block.role != "abstract_number":
-                    marker_block.role = "abstract_number"
-                    marker_block.confidence = 1.0
-                    marker_block.metadata["role_source"] = "model"
-        target: dict[str, object] | None = None
-        for segment in self._document_segments():
-            if any(
-                block_id in blocks_by_id and block_matches_segment(blocks_by_id[block_id], segment)
-                for block_id in candidate_ids
-            ):
-                target = segment
-                break
-        if target is None:
-            current = self._current_segment()
-            target = current[0] if current else None
-        self._set_abstract_number(abstract_number, target)
-        if target is not None and marker_ids:
-            target["abstract_number_block_id"] = marker_ids[0]
-        self._refresh_article_buttons()
-        self._log(f"Adopted abstract number {abstract_number} from the model answer.")
+        return
 
     def _set_abstract_number(self, abstract_number: str, target: dict[str, object] | None) -> None:
         """Store an abstract number on the document and, when known, its segment.
@@ -4403,7 +4578,10 @@ class MainWindow(QMainWindow):
         and finished article bookkeeping stays valid as it is.
         """
 
-        previous = self._normalize_abstract_number(self.document.metadata.get("abstract_number", ""))
+        previous = self._normalize_abstract_number(
+            target.get("abstract_number", "") if target is not None
+            else self.document.metadata.get("abstract_number", "")
+        )
         if previous and previous.casefold() != abstract_number.casefold():
             # Keep the old marker so a correcting edit still trims it off the title.
             aliases = self.document.metadata.get("abstract_number_aliases")
@@ -4449,7 +4627,16 @@ class MainWindow(QMainWindow):
         if target is None:
             current = self._current_segment()
             target = current[0] if current else None
-        self._set_abstract_number(value, target)
+        # In the explicit-number workflow the value entered in Article
+        # Metadata is authoritative.  A marker classified while assigning
+        # roles documents where the number appeared, but must not rename the
+        # article the user has just started.
+        if not (
+            self._uses_explicit_article_flow()
+            and target is not None
+            and str(target.get("abstract_number", "")).strip()
+        ):
+            self._set_abstract_number(value, target)
         if target is not None:
             target["abstract_number_block_id"] = block.id
 
@@ -4513,12 +4700,10 @@ class MainWindow(QMainWindow):
         )
 
     def _sync_block_abstract_number_role(self, block, previous_role: str) -> None:
-        """Apply or undo marker metadata after a manual role change.
+        """Record marker metadata after a manual role change.
 
-        Tagging a block ``abstract_number`` does more than record the marker:
-        when the marker prints a fresh number it also starts a new article at
-        that block, so the classification itself drives the article boundaries
-        instead of a separate split step.
+        This hook only manages body-text exclusion. Article numbers and starts
+        are supplied explicitly through Article Metadata.
         """
 
         if block.role == "abstract_number":
@@ -4526,8 +4711,13 @@ class MainWindow(QMainWindow):
             # _apply_abstract_number_role records must land on the article the
             # marker starts, not on the one that happens to contain the block
             # before the cut exists.
-            self._maybe_split_article_at_marker(block)
-            self._apply_abstract_number_role(block)
+            # Article boundaries in the explicit-number workflow are made
+            # only by “Start Article With This Number”.  Do not turn a marker
+            # role assigned during the current article into a second tab.
+            marker_ids = list(self.document.metadata.get("abstract_number_block_ids", []))
+            if block.id not in marker_ids:
+                marker_ids.append(block.id)
+                self.document.metadata["abstract_number_block_ids"] = marker_ids
         elif previous_role == "abstract_number":
             self._clear_abstract_number_role(block.id)
 
@@ -4686,8 +4876,14 @@ class MainWindow(QMainWindow):
         for number in numbers:
             if not number or number.upper() == "ABSN":
                 continue
+            # PDF text often inserts a discretionary/soft hyphen next to the
+            # printed hyphen in identifiers (for example ``EPO-\u00ad0818``).
+            # Treat all dash variants as the identifier's one hyphen.
+            number_pattern = re.escape(number).replace(
+                r"\-", r"[-\u00ad\u2010-\u2015]+"
+            )
             title = re.sub(
-                rf"^\s*[\(\[]?{re.escape(number)}[\)\]]?\s*(?:\||\u2502|[:.\-\u2013\u2014])?\s+",
+                rf"^\s*[\(\[]?{number_pattern}[\)\]]?\s*(?:\||\u2502|[:.\-\u2013\u2014])?\s+",
                 "",
                 title,
                 count=1,
@@ -5422,12 +5618,11 @@ class MainWindow(QMainWindow):
     def _load_pdf_path(self, path: str) -> None:
         self.document = self.extractor.extract(path)
         self._startup_flow = True
-        # Detection is a suggestion, not an article: an article exists only once
-        # the user classifies its title. The detected ranges are parked as
-        # reference so a title can inherit the Abstract No its range prints.
-        detected = self.document.metadata.pop("article_segments", None)
-        if isinstance(detected, list) and detected:
-            self.document.metadata[self.DETECTED_SEGMENTS_KEY] = detected
+        self._explicit_number_workflow = True
+        # Old extractor versions may return marker-derived ranges; discard
+        # them so a number appearing in the PDF cannot create article tabs.
+        self.document.metadata.pop("article_segments", None)
+        self.document.metadata.pop(self.DETECTED_SEGMENTS_KEY, None)
         self._undo_stack.clear()
         self._html_preview_merges.clear()
         self._active_zone_move_undo_id = None
@@ -5456,7 +5651,7 @@ class MainWindow(QMainWindow):
         self._manual_document_author_links = {}
         self._invalidate_segment_identity()
         self.viewer.set_deleted_block_ids(set())
-        self._sync_abstract_number_from_roles()
+        # Keep the article number at its explicit default until the user enters it.
         self._update_document_model()
         self.viewer.load_pdf(path)
         self.viewer.set_blocks([asdict(block) for block in self.document.blocks])
@@ -5475,11 +5670,7 @@ class MainWindow(QMainWindow):
         self._log(f"Detected {len(self.document.blocks)} text blocks")
         detected_count = len(self._detected_segments())
         if detected_count:
-            self._log(
-                f"Detected {detected_count} article range(s); enter an article/abstract "
-                "number in Article Metadata and select Start Article With This Number to "
-                "begin the first article."
-            )
+            self._log("Ignored extracted article-number markers; enter each number manually.")
         self._log(f"Pipeline report written to {report_path}")
         self.metadata_panel.set_merge_details(None)
         self.props.set_role(None)
@@ -5641,6 +5832,7 @@ class MainWindow(QMainWindow):
                 )
                 return
             self._set_abstract_number(abstract_number, segment)
+            self.document.metadata["abstract_number"] = abstract_number
             self._update_document_model()
             self.viewer.set_blocks([asdict(block) for block in self.document.blocks])
             self._populate_tree()
@@ -5667,6 +5859,10 @@ class MainWindow(QMainWindow):
                 "before selecting Start Article With This Number.",
             )
             return
+
+        # Keep the actual field value in sync with the newly active segment so
+        # the tab and Finish action show exactly the number just entered.
+        self.metadata_panel.set_abstract_number(abstract_number, enabled=True, hint=None)
 
         self._update_document_model()
         self.viewer.set_blocks([asdict(block) for block in self.document.blocks])

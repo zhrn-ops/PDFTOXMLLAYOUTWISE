@@ -175,28 +175,11 @@ class PDFExtractor:
         document.metadata["hidden_text_line_count"] = hidden_text_line_count
         # The UI may replace display blocks during review; keep extraction immutable.
         document.raw_blocks = [replace(block, metadata=dict(block.metadata)) for block in document.blocks]
-        abstract_numbers = self._extract_abstract_numbers(document.blocks)
-        if abstract_numbers:
-            first_marker = abstract_numbers[0]
-            document.metadata["abstract_number"] = first_marker["abstract_number"]
-            # Only a block holding nothing but the marker may be dropped from the
-            # article body; an inline marker such as "(S100) PHASE 3 ..." lives
-            # inside the title line and must stay.
-            marker_block = next(
-                (block for block in document.blocks if block.id == first_marker["block_id"]), None
-            )
-            document.metadata["abstract_number_block_ids"] = (
-                [first_marker["block_id"]]
-                if marker_block is not None
-                and self._is_abstract_number_only(marker_block.text, first_marker["abstract_number"])
-                else []
-            )
-            document.metadata["article_segments"] = self._build_article_segments(
-                abstract_numbers,
-                max((block.page for block in document.blocks), default=1),
-            )
-        elif "abstract_number" not in document.metadata:
-            document.metadata["abstract_number"] = "ABSN"
+        # Abstract numbers and article starts are chosen in the UI. Extraction
+        # only provides block text and layout; matching marker-like text here
+        # can otherwise create phantom articles before the user starts one.
+        document.metadata["abstract_number"] = "ABSN"
+        document.metadata["abstract_number_block_ids"] = []
         LOGGER.info("Extracted %d blocks from %s", len(document.blocks), path.name)
         return document
 
