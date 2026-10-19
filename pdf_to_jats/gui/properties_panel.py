@@ -297,14 +297,28 @@ class MetadataPanel(QWidget):
         self.abstract_number_editor.textChanged.connect(self._on_abstract_number_text_changed)
         self.apply_abstract_number_btn = QPushButton("Start Article With This Number")
         self.apply_abstract_number_btn.setEnabled(False)
+        self.start_without_abstract_number_btn = QPushButton(
+            "Start Article Without Number (Use ABSN)"
+        )
+        self.start_without_abstract_number_btn.setToolTip(
+            "Use the ABSN placeholder when this article has no abstract number."
+        )
+        self.start_without_abstract_number_btn.setEnabled(False)
+        self.abstract_number_fallback_note = QLabel(
+            "No number available? Start without one; XML will use ABSN and preserve the title."
+        )
+        self.abstract_number_fallback_note.setWordWrap(True)
         self.article_hint = QLabel()
         self.article_hint.setWordWrap(True)
         article_form.addRow("Abstract No", self.abstract_number_editor)
         article_form.addRow("", self.apply_abstract_number_btn)
+        article_form.addRow("", self.start_without_abstract_number_btn)
+        article_form.addRow(self.abstract_number_fallback_note)
         article_form.addRow(self.article_hint)
         layout.addWidget(self.article_box)
         self._abstract_number_value = ""
         self._abstract_number_editable = False
+        self._can_start_without_abstract_number = False
 
         self.review_box = QGroupBox("Author / Affiliation Review")
         review_layout = QVBoxLayout(self.review_box)
@@ -370,11 +384,13 @@ class MetadataPanel(QWidget):
             value = ""
         self._abstract_number_value = value
         self._abstract_number_editable = enabled
+        self._can_start_without_abstract_number = enabled and hint is not None and not value
         self.abstract_number_editor.blockSignals(True)
         self.abstract_number_editor.setText(value)
         self.abstract_number_editor.blockSignals(False)
         self.abstract_number_editor.setEnabled(enabled)
         self.apply_abstract_number_btn.setEnabled(False)
+        self.start_without_abstract_number_btn.setEnabled(self._can_start_without_abstract_number)
         self.article_hint.setText(hint or "")
 
     def _on_abstract_number_text_changed(self, text: str) -> None:
@@ -382,6 +398,9 @@ class MetadataPanel(QWidget):
 
         self.apply_abstract_number_btn.setEnabled(
             self._abstract_number_editable and text.strip() != self._abstract_number_value
+        )
+        self.start_without_abstract_number_btn.setEnabled(
+            self._can_start_without_abstract_number and not text.strip()
         )
 
     def set_link_review(

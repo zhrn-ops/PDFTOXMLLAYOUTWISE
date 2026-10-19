@@ -863,6 +863,23 @@ def test_selection_export_document_uses_only_selected_block_ids():
     assert exported.metadata["abstract_number"] == "ABSN"
 
 
+def test_placeholder_absn_can_start_an_article_from_a_selected_block():
+    """The explicit no-number action must create a normal working article."""
+
+    document = _stacked_page_document()
+    window = _window(document)
+    window._startup_flow = True
+    window._explicit_number_workflow = True
+    window._selected_block_ids = {"block_001"}
+    window._refresh_selected_blocks_view = lambda: None
+
+    assert window._start_article_from_number("ABSN", allow_placeholder=True)
+
+    segment = document.metadata["article_segments"][0]
+    assert segment["abstract_number"] == "ABSN"
+    assert segment["block_ids"] == ["block_001"]
+
+
 def test_article_export_keeps_a_merged_block_owned_by_its_merged_id():
     """Role assignment after a merge remains visible to that article's XML."""
 

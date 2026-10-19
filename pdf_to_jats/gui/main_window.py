@@ -293,6 +293,9 @@ class MainWindow(QMainWindow):
         self.clear_selection_btn.clicked.connect(self.clear_selection)
         self.props.apply_role_btn.clicked.connect(self.apply_selected_block_role)
         self.metadata_panel.apply_abstract_number_btn.clicked.connect(self.apply_abstract_number)
+        self.metadata_panel.start_without_abstract_number_btn.clicked.connect(
+            self.start_article_without_abstract_number
+        )
         self.actions_layout = actions
         self.tree.itemSelectionChanged.connect(self._on_tree_selection_changed)
         self.tree.itemChanged.connect(self._on_tree_item_changed)
@@ -630,13 +633,13 @@ class MainWindow(QMainWindow):
             self._update_document_model()
             export_document = self._document_with_html_preview_continuations()
             segment_document = self._document_for_segment(finished_segment, export_document)
-            output_dir = self._choose_output_directory(
-                "Choose XML output folder", self.config.generated_xml_dir
+            suggested = self.config.generated_xml_dir / self._article_filename(
+                segment_document, 1, 1
             )
-            if output_dir is None:
+            output_path = self._choose_xml_path(suggested)
+            if output_path is None:
                 return
-            filename = self._article_filename(segment_document, 1, 1)
-            generated_path = self.generator.generate(segment_document, output_dir / filename)
+            generated_path = self.generator.generate(segment_document, output_path)
             self.current_xml_path = generated_path
             errors = self.validator.validate(generated_path)
             for error in errors:
@@ -669,12 +672,10 @@ class MainWindow(QMainWindow):
                 "block_ids": [block.id for block in selected],
             }
             segment_document = self._document_for_segment(segment, export_document)
-            output_dir = self._choose_output_directory(
-                "Choose XML output folder", self.config.generated_xml_dir
-            )
-            if output_dir is None:
+            output_path = self._choose_xml_path(self.config.generated_xml_dir / "article.xml")
+            if output_path is None:
                 return
-            generated_path = self.generator.generate(segment_document, output_dir / "article.xml")
+            generated_path = self.generator.generate(segment_document, output_path)
             self.current_xml_path = generated_path
             errors = self.validator.validate(generated_path)
             for error in errors:
@@ -718,15 +719,12 @@ class MainWindow(QMainWindow):
             )
             return
         documents = self._documents_to_export(export_document)
-        output_dir = self._choose_output_directory(
-            "Choose XML output folder", self.config.generated_xml_dir
-        )
-        if output_dir is None:
-            return
         output_paths: list[Path] = []
         for index, segment_document in enumerate(documents, start=1):
-            filename = "article.xml" if len(documents) == 1 else f"article_{index:03d}.xml"
-            output_path = output_dir / filename
+            filename = self._article_filename(segment_document, index, len(documents))
+            output_path = self._choose_xml_path(self.config.generated_xml_dir / filename)
+            if output_path is None:
+                break
             generated_path = self.generator.generate(segment_document, output_path)
             output_paths.append(generated_path)
             errors = self.validator.validate(generated_path)
@@ -736,6 +734,48 @@ class MainWindow(QMainWindow):
             else:
                 self._log(f"XML written to {generated_path}")
         self.current_xml_path = output_paths[0] if output_paths else None
+
+    def _choose_xml_path(self, suggested_path: Path) -> Path | None:
+        """Ask where to save one XML file, starting with a useful filename."""
+
+        selected, _filter = QFileDialog.getSaveFileName(
+            self,
+            "Save XML",
+            str(suggested_path.resolve()),
+            "XML files (*.xml)",
+        )
+        if not selected:
+            return None
+        path = Path(selected)
+        if path.suffix.lower() != ".xml":
+            path = path.with_suffix(".xml")
+        return path
+
+    @staticmethod
+    def _available_xml_path(path: Path) -> Path:
+        """Return an unused XML filename for unattended batch exports."""
+
+        if not path.exists():
+            return path
+        suffix = path.suffix or ".xml"
+        base = path.stem
+        index = 2
+        candidate = path.with_name(f"{base}_{index}{suffix}")
+        while candidate.exists():
+            index += 1
+            candidate = path.with_name(f"{base}_{index}{suffix}")
+        return candidate
+
+    def _export_article_with_save_dialog(
+        self, segment: dict[str, object]
+    ) -> tuple[Path | None, list]:
+        """Run the normal validated finish export with a user-selected path."""
+
+        self._prompt_for_article_xml_path = True
+        try:
+            return self._export_article_xml(segment)
+        finally:
+            self._prompt_for_article_xml_path = False
 
     def export_json(self) -> None:
         if self.document is None:
@@ -841,7 +881,7 @@ class MainWindow(QMainWindow):
         output_paths: list[Path] = []
         for index, segment_document in enumerate(documents, start=1):
             filename = self._article_filename(segment_document, index, len(documents))
-            output_path = output_dir / filename
+            output_path = self._available_xml_path(output_dir / filename)
             generated_path = self.generator.generate(segment_document, output_path)
             output_paths.append(generated_path)
             errors = self.validator.validate(generated_path)
@@ -1265,8 +1305,8 @@ class MainWindow(QMainWindow):
                 f"reopened before a new article can start."
             )
         return (
-            "No article exists yet. Enter an article/abstract number above and then "
-            "select Start Article With This Number to begin the first article."
+            "Enter an article/abstract number above and select Start Article With This Number. "
+            "If this article has no number, select Start Article Without Number (Use ABSN)."
         )
 
     def _startup_articles_hint(self) -> str:
@@ -1670,7 +1710,7 @@ class MainWindow(QMainWindow):
         # content. Validate the segment before writing or locking it, so both
         # finish paths share one gate.
         try:
-            generated_path, validation_errors = self._export_article_xml(segment)
+            generated_path, validation_errors = self._export_article_with_save_dialog(segment)
         except Exception as exc:
             QMessageBox.critical(self, "Export failed", f"The article XML could not be written: {exc}")
             return
@@ -1685,6 +1725,8 @@ class MainWindow(QMainWindow):
                 "Article needs review",
                 "The article was not exported or locked because it is incomplete:\n\n" + messages,
             )
+            return
+        if generated_path is None:
             return
         locked_count = self._lock_segment_blocks(segment, key)
         # Do not silently make a detected/remaining range the next working
@@ -1724,6 +1766,26 @@ class MainWindow(QMainWindow):
         validation_errors = self.validator.validate_document(segment_document)
         if validation_errors:
             return None, validation_errors
+        if getattr(self, "_prompt_for_article_xml_path", False):
+            index_value = segment.get("index")
+            try:
+                index = int(index_value) if index_value is not None else 0
+            except (TypeError, ValueError):
+                index = 0
+            suggested = self.config.generated_xml_dir / self._article_filename(
+                segment_document, index, 1, always_number=index > 0
+            )
+            output_path = self._choose_xml_path(suggested)
+            if output_path is None:
+                return None, []
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            generated_path = self.generator.generate(segment_document, output_path)
+            errors = self.validator.validate(generated_path)
+            for error in errors:
+                self._log(f"Validation error in {generated_path.name}: {error.message}")
+            if not errors:
+                self._log(f"XML written to {generated_path}")
+            return generated_path, errors
         output_dir = self.config.generated_xml_dir
         output_dir.mkdir(parents=True, exist_ok=True)
         return self._export_segment_document(segment, output_dir, segment_document), []
@@ -1852,7 +1914,7 @@ class MainWindow(QMainWindow):
                     self._notify("The selection could not be turned into an article.")
                     return
                 try:
-                    generated_path, validation_errors = self._export_article_xml(segment)
+                    generated_path, validation_errors = self._export_article_with_save_dialog(segment)
                 except Exception as exc:
                     self._rollback_article_change(snapshot)
                     self._notify(f"The article XML could not be written: {exc}")
@@ -1870,6 +1932,9 @@ class MainWindow(QMainWindow):
                         "The selection was not exported or locked because the article is "
                         "incomplete; assign roles to the missing fields and finish again."
                     )
+                    return
+                if generated_path is None:
+                    self._rollback_article_change(snapshot)
                     return
                 locked_count = self._lock_blocks(selected, key)
                 # The next article starts at the first line that was not selected, so the
@@ -1911,7 +1976,7 @@ class MainWindow(QMainWindow):
             self._notify("The selection could not be turned into an article.")
             return
         try:
-            generated_path, validation_errors = self._export_article_xml(segment)
+            generated_path, validation_errors = self._export_article_with_save_dialog(segment)
         except Exception as exc:
             self._rollback_article_change(snapshot)
             self._notify(f"The article XML could not be written: {exc}")
@@ -1929,6 +1994,9 @@ class MainWindow(QMainWindow):
                 "The selection was not exported or locked because the article is "
                 "incomplete; assign roles to the missing fields and finish again."
             )
+            return
+        if generated_path is None:
+            self._rollback_article_change(snapshot)
             return
         locked_count = self._lock_blocks(selected, key)
         # The next article starts at the first line that was not selected, so the
@@ -3495,7 +3563,9 @@ class MainWindow(QMainWindow):
                 return block.id
         return None
 
-    def _start_article_from_number(self, abstract_number: str) -> bool:
+    def _start_article_from_number(
+        self, abstract_number: str, *, allow_placeholder: bool = False
+    ) -> bool:
         """Create an explicitly owned working article for *abstract_number*.
 
         An article started from metadata owns its anchor (or selected blocks), not the
@@ -3505,7 +3575,9 @@ class MainWindow(QMainWindow):
 
         if self.document is None:
             return False
-        if not abstract_number or abstract_number.upper() == "ABSN":
+        if not abstract_number or (
+            abstract_number.upper() == "ABSN" and not allow_placeholder
+        ):
             return False
 
         ordered = self._ensure_reading_orders()
@@ -5789,6 +5861,41 @@ class MainWindow(QMainWindow):
         zone_locked = any(self._article_locked(block) for block in self._blocks_for_zone(zone))
         self.props.set_locked_state(zone_locked)
         self.props.apply_role_btn.setEnabled(not zone_locked)
+
+    def start_article_without_abstract_number(self) -> None:
+        """Start the selected article with the deliberate ABSN placeholder."""
+
+        if self.document is None:
+            QMessageBox.information(self, "No document", "Load a PDF first.")
+            return
+        if self._current_segment() is not None:
+            QMessageBox.information(
+                self,
+                "Article already started",
+                "Finish or reopen the current article before starting another one.",
+            )
+            return
+        if self._document_segments() and not self._selected_block_ids:
+            QMessageBox.information(
+                self,
+                "Select the next article",
+                "Select the first line of the next article before starting it without a number.",
+            )
+            return
+        if not self._start_article_from_number("ABSN", allow_placeholder=True):
+            QMessageBox.information(
+                self,
+                "Could not start article",
+                "Select the first line of the article before starting it without a number.",
+            )
+            return
+        self.metadata_panel.set_abstract_number("ABSN", enabled=True, hint=None)
+        self._update_document_model()
+        self.viewer.set_blocks([asdict(block) for block in self.document.blocks])
+        self._populate_tree()
+        self._update_html_preview()
+        self._refresh_article_buttons()
+        self._log("Started article without an abstract number; XML will use the ABSN placeholder.")
 
     def apply_abstract_number(self) -> None:
         """Start an article from the number typed in Article Metadata.
